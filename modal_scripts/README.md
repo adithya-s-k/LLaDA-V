@@ -20,10 +20,10 @@ Main inference script for OCR and text extraction from document images.
 
 **Features:**
 - ( Three acceleration modes: Fast-dLLM (~6s), Standard Cache (~25s), Baseline (~60s)
-- =� Optimized for document text extraction
+- =� Optimized for document text extraction
 - = Downloads model automatically from HuggingFace (GSAI-ML/LLaDA-V)
-- =� Supports image paths, URLs, and base64 data
-- <� Pre-configured OCR prompt templates
+- =� Supports image paths, URLs, and base64 data
+- <� Pre-configured OCR prompt templates
 
 ## Usage Examples
 
@@ -153,6 +153,25 @@ The default GPU is L40s. You can modify this in the script:
 
 ## Troubleshooting
 
+### gen_length must be divisible by block_length
+
+When using Fast-dLLM acceleration, you may see:
+```
+AssertionError: gen_length % block_length == 0
+```
+
+**Solution:** Use gen_length values that are multiples of 128:
+```bash
+# These work with fast acceleration:
+modal run modal_inference_llada.py --gen-length 128   # ✓
+modal run modal_inference_llada.py --gen-length 256   # ✓
+modal run modal_inference_llada.py --gen-length 512   # ✓ (default)
+modal run modal_inference_llada.py --gen-length 1024  # ✓
+
+# Or use no acceleration for any gen_length:
+modal run modal_inference_llada.py --gen-length 400 --acceleration none
+```
+
 ### CUDA Out of Memory
 
 ```bash
@@ -182,10 +201,18 @@ The first run downloads the model (~8GB) which takes 5-10 minutes. Subsequent ru
 ### Model: LLaDA-V
 
 - **Base**: Diffusion-based language model with visual instruction tuning
-- **Vision Encoder**: SigLIP2 (siglip2-so400m-patch14-384)
+- **Vision Encoder**: SigLIP2 (siglip2-so400m-patch14-384) - **included in checkpoint**
 - **Model ID**: GSAI-ML/LLaDA-V
 - **Context**: 128 tokens with diffusion process
 - **Tokenizer**: Llama 3 based
+
+**What's Included in GSAI-ML/LLaDA-V:**
+The model checkpoint contains ALL components in a single download:
+1. ✅ LLaDA language model (diffusion-based, 8B parameters)
+2. ✅ MM Projector (vision-to-text alignment layer)
+3. ✅ SigLIP Vision Tower (fine-tuned for this model)
+
+**Note:** When you see "Loading vision tower: google/siglip2-so400m-patch14-384" in the logs, it's NOT downloading SigLIP separately. The vision tower weights are already included in the LLaDA-V checkpoint and were fine-tuned together with the language model.
 
 ### Acceleration Mechanisms
 

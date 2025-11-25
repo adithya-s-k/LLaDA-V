@@ -168,12 +168,19 @@ def inference_llada(
     # STEP 1: Load Model
     # =========================================================================
     print("[1/5] Loading LLaDA-V model...")
+    print("  Note: Vision tower (SigLIP) weights are included in LLaDA-V checkpoint")
+    print("  No separate download needed - all weights load from GSAI-ML/LLaDA-V")
+    print()
 
     device = "cuda:0"
     pretrained = "GSAI-ML/LLaDA-V"
     model_name = "llava_llada"  # Critical: triggers correct model loading
 
     try:
+        # This loads:
+        # - LLaDA language model (diffusion-based)
+        # - MM projector (vision-to-text alignment)
+        # - SigLIP vision tower (already fine-tuned, included in checkpoint)
         tokenizer, model, image_processor, max_length = load_pretrained_model(
             pretrained,
             None,  # No base model path needed
@@ -182,7 +189,7 @@ def inference_llada(
             device_map=device,
         )
         model.eval()
-        print("✓ Model loaded successfully")
+        print("\n✓ Model loaded successfully (including vision tower)")
         print(f"  Device: {device}")
         print(f"  Max length: {max_length}")
     except Exception as e:
