@@ -661,7 +661,6 @@ def evaluate_model(
     # Process in batches
     for batch_start in tqdm(range(0, len(dataset), batch_size), desc="Evaluating batches"):
         batch_end = min(batch_start + batch_size, len(dataset))
-        batch = dataset[batch_start:batch_end]
 
         try:
             # Prepare batch
@@ -670,7 +669,9 @@ def evaluate_model(
             batch_ids = []
             batch_image_sizes = []
 
-            for sample in batch:
+            # Get individual samples from the batch
+            for idx in range(batch_start, batch_end):
+                sample = dataset[idx]
                 image = sample["image"]
                 ground_truth = sample["conversations"][1]["value"]
 
@@ -720,44 +721,54 @@ def evaluate_model(
                     temperature=0.0,
                 )
 
+            # Debug: Check output shapes
+            if batch_start == 0:
+                print(f"  Debug: batch_input_ids.shape = {batch_input_ids.shape}")
+                print(f"  Debug: output_ids.shape = {output_ids.shape}")
+                print(f"  Debug: num samples in batch = {len(batch_ground_truths)}")
+
             # Decode each output in the batch
             for i, (output, ground_truth, sample_id) in enumerate(zip(output_ids, batch_ground_truths, batch_ids)):
-                prediction = tokenizer.decode(
-                    output[batch_input_ids.shape[1]:], skip_special_tokens=True
-                ).strip()
+                try:
+                    prediction = tokenizer.decode(
+                        output[batch_input_ids.shape[1]:], skip_special_tokens=True
+                    ).strip()
 
-                # Calculate metrics
-                is_exact = prediction == ground_truth
-                if is_exact:
-                    exact_matches += 1
+                    # Calculate metrics
+                    is_exact = prediction == ground_truth
+                    if is_exact:
+                        exact_matches += 1
 
-                bleu = sentence_bleu(
-                    [list(ground_truth)],
-                    list(prediction),
-                    smoothing_function=SmoothingFunction().method1,
-                )
-                ed = Levenshtein.distance(prediction, ground_truth)
-                cer_v = cer(ground_truth, prediction)
-                wer_v = wer(ground_truth, prediction)
+                    bleu = sentence_bleu(
+                        [list(ground_truth)],
+                        list(prediction),
+                        smoothing_function=SmoothingFunction().method1,
+                    )
+                    ed = Levenshtein.distance(prediction, ground_truth)
+                    cer_v = cer(ground_truth, prediction)
+                    wer_v = wer(ground_truth, prediction)
 
-                bleu_scores.append(bleu)
-                edit_distances.append(ed)
-                cer_scores.append(cer_v)
-                wer_scores.append(wer_v)
+                    bleu_scores.append(bleu)
+                    edit_distances.append(ed)
+                    cer_scores.append(cer_v)
+                    wer_scores.append(wer_v)
 
-                results.append({
-                    "id": sample_id,
-                    "ground_truth": ground_truth,
-                    "prediction": prediction,
-                    "exact_match": is_exact,
-                    "bleu": bleu,
-                    "edit_distance": ed,
-                    "cer": cer_v,
-                    "wer": wer_v,
-                })
+                    results.append({
+                        "id": sample_id,
+                        "ground_truth": ground_truth,
+                        "prediction": prediction,
+                        "exact_match": is_exact,
+                        "bleu": bleu,
+                        "edit_distance": ed,
+                        "cer": cer_v,
+                        "wer": wer_v,
+                    })
+                except Exception as e:
+                    print(f"  Error processing sample {sample_id}: {e}")
+                    continue
 
             # Print progress
-            if len(results) % 50 == 0:
+            if len(results) % 20 == 0 and len(results) > 0:
                 current_acc = exact_matches / len(results) * 100
                 print(f"  Progress: {len(results)}/{len(dataset)} | Exact Match: {current_acc:.2f}%")
 
