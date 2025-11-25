@@ -559,6 +559,7 @@ def evaluate_model(
     output_dir="/data/evaluation_results",
     max_samples: int = None,
     max_new_tokens: int = 512,
+    batch_size: int = 4,  # Number of samples to process at once
 ):
     """
     Evaluate fine-tuned LLaDA-V model on validation set.
@@ -576,6 +577,7 @@ def evaluate_model(
         output_dir: Directory to save evaluation results
         max_samples: Maximum samples to evaluate (None for all)
         max_new_tokens: Maximum tokens to generate
+        batch_size: Number of samples to process at once (default=4 for speed)
 
     Returns:
         Dict with metrics and results file path
@@ -646,86 +648,105 @@ def evaluate_model(
     if max_samples:
         dataset = dataset.select(range(min(max_samples, len(dataset))))
 
-    print(f"✓ Evaluating {len(dataset)} samples")
+    print(f"✓ Evaluating {len(dataset)} samples with batch_size={batch_size}")
 
-    # Evaluation loop
+    # Evaluation loop with batching
     print("\n[3/3] Running evaluation...")
     results = []
     exact_matches = 0
     bleu_scores, edit_distances, cer_scores, wer_scores = [], [], [], []
 
-    for idx, sample in enumerate(tqdm(dataset, desc="Evaluating")):
+    from PIL import Image as PILImage
+
+    # Process in batches
+    for batch_start in tqdm(range(0, len(dataset), batch_size), desc="Evaluating batches"):
+        batch_end = min(batch_start + batch_size, len(dataset))
+        batch = dataset[batch_start:batch_end]
+
         try:
-            from PIL import Image as PILImage
+            # Prepare batch
+            batch_images = []
+            batch_ground_truths = []
+            batch_ids = []
+            batch_image_sizes = []
 
-            image = sample["image"]
-            # Get ground truth from conversations
-            ground_truth = sample["conversations"][1]["value"]
+            for sample in batch:
+                image = sample["image"]
+                ground_truth = sample["conversations"][1]["value"]
 
-            # Ensure image is PIL Image
-            if not isinstance(image, PILImage.Image):
-                image = PILImage.open(image).convert("RGB")
-            elif image.mode != "RGB":
-                image = image.convert("RGB")
+                # Ensure image is PIL Image
+                if not isinstance(image, PILImage.Image):
+                    image = PILImage.open(image).convert("RGB")
+                elif image.mode != "RGB":
+                    image = image.convert("RGB")
 
-            # Prepare input
+                batch_images.append(image)
+                batch_ground_truths.append(ground_truth)
+                batch_ids.append(sample["id"])
+                batch_image_sizes.append(image.size)
+
+            # Prepare inputs
             text = "<image>\nConvert this mathematical expression to LaTeX code."
-            input_ids = (
-                tokenizer_image_token(
+
+            # Tokenize for each sample (they should all be the same length)
+            batch_input_ids = []
+            for _ in batch_images:
+                input_ids = tokenizer_image_token(
                     text, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt"
                 )
-                .unsqueeze(0)
-                .to(device)
-            )
+                batch_input_ids.append(input_ids)
 
-            # Process image (returns list of tensors)
-            image_tensor = process_images([image], image_processor, model.config)
-            if image_tensor is None or len(image_tensor) == 0:
-                print(f"  Warning: process_images returned None for sample {idx}")
+            # Stack into batch
+            batch_input_ids = torch.stack(batch_input_ids).to(device)
+
+            # Process images
+            image_tensors = process_images(batch_images, image_processor, model.config)
+            if image_tensors is None or len(image_tensors) == 0:
+                print(f"  Warning: process_images returned None for batch starting at {batch_start}")
                 continue
 
-            image_tensor = [
-                _image.to(dtype=torch.float16, device=device) for _image in image_tensor
+            image_tensors = [
+                _image.to(dtype=torch.float16, device=device) for _image in image_tensors
             ]
-            image_sizes = [image.size]  # (width, height) tuple
 
-            # Generate (match inference script format)
+            # Generate for batch
             with torch.no_grad():
                 output_ids = model.generate(
-                    input_ids,
-                    images=image_tensor,
-                    image_sizes=image_sizes,
+                    batch_input_ids,
+                    images=image_tensors,
+                    image_sizes=batch_image_sizes,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
                     temperature=0.0,
-                )[0]
+                )
 
-            prediction = tokenizer.decode(
-                output_ids[input_ids.shape[1] :], skip_special_tokens=True
-            ).strip()
+            # Decode each output in the batch
+            for i, (output, ground_truth, sample_id) in enumerate(zip(output_ids, batch_ground_truths, batch_ids)):
+                prediction = tokenizer.decode(
+                    output[batch_input_ids.shape[1]:], skip_special_tokens=True
+                ).strip()
 
-            # Calculate metrics
-            is_exact = prediction == ground_truth
-            if is_exact:
-                exact_matches += 1
+                # Calculate metrics
+                is_exact = prediction == ground_truth
+                if is_exact:
+                    exact_matches += 1
 
-            bleu = sentence_bleu(
-                [list(ground_truth)],
-                list(prediction),
-                smoothing_function=SmoothingFunction().method1,
-            )
-            ed = Levenshtein.distance(prediction, ground_truth)
-            cer_v = cer(ground_truth, prediction)
-            wer_v = wer(ground_truth, prediction)
+                bleu = sentence_bleu(
+                    [list(ground_truth)],
+                    list(prediction),
+                    smoothing_function=SmoothingFunction().method1,
+                )
+                ed = Levenshtein.distance(prediction, ground_truth)
+                cer_v = cer(ground_truth, prediction)
+                wer_v = wer(ground_truth, prediction)
 
-            bleu_scores.append(bleu)
-            edit_distances.append(ed)
-            cer_scores.append(cer_v)
-            wer_scores.append(wer_v)
+                bleu_scores.append(bleu)
+                edit_distances.append(ed)
+                cer_scores.append(cer_v)
+                wer_scores.append(wer_v)
 
-            results.append(
-                {
-                    "id": sample["id"],
+                results.append({
+                    "id": sample_id,
                     "ground_truth": ground_truth,
                     "prediction": prediction,
                     "exact_match": is_exact,
@@ -733,18 +754,17 @@ def evaluate_model(
                     "edit_distance": ed,
                     "cer": cer_v,
                     "wer": wer_v,
-                }
-            )
+                })
 
-            # Print progress every 50 samples
-            if (idx + 1) % 50 == 0:
-                current_acc = exact_matches / (idx + 1) * 100
-                print(
-                    f"  Progress: {idx + 1}/{len(dataset)} | Exact Match: {current_acc:.2f}%"
-                )
+            # Print progress
+            if len(results) % 50 == 0:
+                current_acc = exact_matches / len(results) * 100
+                print(f"  Progress: {len(results)}/{len(dataset)} | Exact Match: {current_acc:.2f}%")
 
         except Exception as e:
-            print(f"Error on sample {idx}: {e}")
+            print(f"Error on batch starting at {batch_start}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
     # Calculate final metrics
