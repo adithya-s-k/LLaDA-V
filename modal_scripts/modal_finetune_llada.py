@@ -432,7 +432,8 @@ def train_llada(
     lora_alpha=16,
     lora_dropout=0.05,
     # DeepSpeed configuration
-    deepspeed_config="zero2",  # "zero2" for LoRA (zero3 causes issues with frozen vision tower)
+    # deepspeed_config="zero3",  # "zero3" recommended for LoRA (best practice from Bunny)
+    deepspeed_config="zero2",  # "zero2" for full fine-tuning (more stable)
     # Other settings
     save_steps=500,
     logging_steps=10,
@@ -458,7 +459,7 @@ def train_llada(
         lora_r: LoRA rank (only used if use_lora=True)
         lora_alpha: LoRA alpha (only used if use_lora=True)
         lora_dropout: LoRA dropout (only used if use_lora=True)
-        deepspeed_config: DeepSpeed configuration ("zero2" recommended for LoRA, "zero3" for full fine-tuning)
+        deepspeed_config: DeepSpeed configuration ("zero3" recommended for LoRA, "zero2" for pretraining)
 
     Returns:
         Dict with status and output directory
@@ -506,9 +507,41 @@ def train_llada(
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
+    # Validate DeepSpeed config has optimizer section
+    import json as json_module
+
+    deepspeed_config_path = f"/root/scripts/{deepspeed_config}.json"
+
+    if os.path.exists(deepspeed_config_path):
+        with open(deepspeed_config_path, "r") as f:
+            ds_config = json_module.load(f)
+
+        if "optimizer" not in ds_config:
+            print("=" * 80)
+            print("ERROR: DeepSpeed config missing 'optimizer' section!")
+            print(f"Config file: {deepspeed_config_path}")
+            print()
+            print(
+                "This will cause 'AttributeError: DummyOptim object has no attribute step'"
+            )
+            print()
+            print("Recommended fixes:")
+            print("  1. Add optimizer config to the DeepSpeed JSON file")
+            print("  2. Use a config that has optimizer: zero2, zero3_offload, zero3pp")
+            if use_lora:
+                print("  3. For LoRA: Use --deepspeed-config zero3 (default)")
+            print("=" * 80)
+            raise ValueError(
+                f"DeepSpeed config '{deepspeed_config}.json' is missing 'optimizer' section. "
+                "Training cannot proceed without a valid optimizer configuration."
+            )
+    else:
+        print(f"Warning: DeepSpeed config not found at {deepspeed_config_path}")
+
     # Build training command based on llada_v_finetune.sh
     # Extract image folder from dataset path (parent directory of JSON file)
     import os as os_module
+
     dataset_dir = os_module.path.dirname(dataset_path)
 
     command = [
