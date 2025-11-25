@@ -55,45 +55,72 @@ image = (
     .apt_install(
         "git",
         "build-essential",
+        "cmake",  # Required for building sentencepiece
+        "pkg-config",  # Required for building sentencepiece
+        "clang",  # Required for building scikit-learn
         "libopenmpi-dev",
         "openmpi-bin",
     )
     .uv_pip_install(
-        [
-            "torch",
-            "torchvision",
-            "torchaudio",
-        ]
+        # PyTorch (install first for CUDA support)
+        "torch",
+        "torchvision",
+        "torchaudio",
     )
     .uv_pip_install(
-        "transformers==4.40.0",  # Pin to match LLaDA-V requirements
-        "accelerate==0.29.3",
+        # Core training dependencies from pyproject.toml [train]
         "deepspeed==0.14.4",
-        "peft==0.9.0",  # For LoRA support
-        "datasets",
-        "pillow",
-        "timm==0.9.16",
+        "peft==0.9.0",
+        "accelerate==0.29.1",
+        "transformers",
+        "bitsandbytes==0.45.3",
+        "tokenizers~=0.15.2",
+        # Data and utilities
+        "datasets==2.16.1",
+        "sentencepiece~=0.1.99",
+        "open_clip_torch",
+        "timm",
+        "hf_transfer",
+        "hf_xet",
+        # Vision libraries
+        "opencv-python",
+        "av",
+        "decord",
+        # Model utilities
         "einops==0.6.1",
-        "safetensors==0.4.3",
-        "huggingface_hub==0.22.2",
+        "einops-exts==0.0.4",
+        "safetensors",
+        # ML libraries
+        "scikit-learn>=1.3.2",  # Upgraded from 1.2.2 for Python 3.12 wheel support
+        "scipy",
+        "numpy",
+        # API and serving
+        "fastapi",
+        "uvicorn",
+        "gradio_client==0.2.9",
+        # Logging and tracking
         "wandb",
-        "bitsandbytes",
-        "opencv-python-headless",
+        "pynvml",
+        # Distributed training
+        "mpi4py",
+        # Utilities from [standalone]
+        "shortuuid",
+        "httpx==0.24.0",
+        "ftfy",
+        "requests",
+        "tyro",
+        "urllib3<=2.0.0",
+        "pydantic==1.10.8",
+        "jinja2==3.1.5",
+        # Evaluation metrics
         "nltk",
-        "rouge_score",
         "jiwer",
         "python-Levenshtein",
-        "scikit-learn",
+        # General utilities
         "tqdm",
-        "sentencepiece",
         "packaging",
         "pyyaml",
-    )
-    .env(
-        {
-            "HF_HOME": "/data/.cache",
-            "WANDB_PROJECT": "llada-latex-ocr",
-        }
+        "webdataset",
     )
     .add_local_dir(
         local_path=str(Path(__file__).parent.parent / "train"),
@@ -109,6 +136,12 @@ image = (
             "*.png",
             "*.jpg",
         ],
+    )
+    .env(
+        {
+            "HF_HOME": "/data/.cache",
+            "WANDB_PROJECT": "llada-latex-ocr",
+        }
     )
 )
 
@@ -248,18 +281,48 @@ def download_and_prepare_dataset(
     if len(filtered_dataset) == 0:
         raise ValueError("No valid samples after filtering")
 
-    # Save dataset
-    filtered_dataset.save_to_disk(target_dataset_path)
+    # Save dataset in JSON format for LLaDA-V training
+    import json
+    import os
+
+    os.makedirs(target_dataset_path, exist_ok=True)
+    images_dir = os.path.join(target_dataset_path, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    # Convert dataset to JSON with saved images
+    json_data = []
+    for sample in filtered_dataset:
+        # Save image to file
+        image = sample["image"]
+        image_filename = f"{sample['id']}.jpg"
+        image_path = os.path.join(images_dir, image_filename)
+        image.save(image_path, "JPEG")
+
+        # Create JSON entry with relative image path
+        json_entry = {
+            "id": sample["id"],
+            "image": os.path.join("images", image_filename),
+            "conversations": sample["conversations"],
+        }
+        json_data.append(json_entry)
+
+    # Save JSON file
+    json_path = os.path.join(target_dataset_path, "dataset.json")
+    with open(json_path, "w") as f:
+        json.dump(json_data, f, indent=2)
+
     volume.commit()
 
     success_rate = len(filtered_dataset) / len(dataset) * 100
     print(
-        f"✓ Saved {len(filtered_dataset)}/{len(dataset)} samples ({success_rate:.1f}%) to {target_dataset_path}"
+        f"✓ Saved {len(filtered_dataset)}/{len(dataset)} samples ({success_rate:.1f}%)"
     )
+    print(f"  JSON file: {json_path}")
+    print(f"  Images directory: {images_dir}")
 
     return {
         "status": "completed",
-        "dataset_path": target_dataset_path,
+        "dataset_path": json_path,  # Return JSON file path, not directory
         "samples": len(filtered_dataset),
         "success_rate": f"{success_rate:.1f}%",
     }
@@ -326,7 +389,7 @@ def download_model(force_redownload: bool = False):
     # Verify config exists
     if not os.path.exists(config_path):
         print(f"Error: config.json not found at {config_path}")
-        raise FileNotFoundError(f"Model download failed - config.json missing")
+        raise FileNotFoundError("Model download failed - config.json missing")
 
     volume.commit()
     print(f"✓ Model ready at {model_path}")
@@ -350,13 +413,13 @@ def download_model(force_redownload: bool = False):
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada(
-    dataset_path="/data/latex_ocr_dataset_train",
+    dataset_path="/data/latex_ocr_dataset_train/dataset.json",
     model_path="/data/models/LLaDA-V",
     output_dir="/data/checkpoints/llada-latex-ocr",
     # Training mode
     use_lora=False,  # True for LoRA, False for full fine-tuning
-    # Tunable components
-    mm_tunable_parts="mm_vision_tower,mm_mlp_adapter,mm_language_model",
+    # Tunable components (for LoRA: freeze vision tower, train adapter + LLM)
+    mm_tunable_parts="mm_mlp_adapter,mm_language_model",
     # Training hyperparameters
     num_train_epochs=3,
     per_device_train_batch_size=4,
@@ -369,7 +432,7 @@ def train_llada(
     lora_alpha=16,
     lora_dropout=0.05,
     # DeepSpeed configuration
-    deepspeed_config="zero2",  # "zero2" or "zero3"
+    deepspeed_config="zero2",  # "zero2" for LoRA (zero3 causes issues with frozen vision tower)
     # Other settings
     save_steps=500,
     logging_steps=10,
@@ -385,9 +448,9 @@ def train_llada(
         output_dir: Directory to save checkpoints
         use_lora: Enable LoRA fine-tuning (faster, smaller checkpoints)
         mm_tunable_parts: Components to train (comma-separated):
-            - "mm_mlp_adapter" - Only projector
-            - "mm_vision_tower,mm_mlp_adapter" - Vision + projector
-            - "mm_vision_tower,mm_mlp_adapter,mm_language_model" - Full
+            - "mm_mlp_adapter" - Only projector (minimal training)
+            - "mm_mlp_adapter,mm_language_model" - Adapter + LLM (recommended for LoRA)
+            - "mm_vision_tower,mm_mlp_adapter,mm_language_model" - Full (only for non-LoRA)
         num_train_epochs: Number of training epochs
         per_device_train_batch_size: Batch size per GPU
         gradient_accumulation_steps: Gradient accumulation steps
@@ -395,7 +458,7 @@ def train_llada(
         lora_r: LoRA rank (only used if use_lora=True)
         lora_alpha: LoRA alpha (only used if use_lora=True)
         lora_dropout: LoRA dropout (only used if use_lora=True)
-        deepspeed_config: DeepSpeed configuration ("zero2" or "zero3")
+        deepspeed_config: DeepSpeed configuration ("zero2" recommended for LoRA, "zero3" for full fine-tuning)
 
     Returns:
         Dict with status and output directory
@@ -443,22 +506,44 @@ def train_llada(
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
 
-    # Build training command
+    # Build training command based on llada_v_finetune.sh
+    # Extract image folder from dataset path (parent directory of JSON file)
+    import os as os_module
+    dataset_dir = os_module.path.dirname(dataset_path)
+
     command = [
         "python",
         "/root/llava/train/train_mem.py",
+        # Model and data configuration
         "--model_name_or_path",
         model_path,
         "--version",
         "llava_llada",
         "--data_path",
         dataset_path,
-        "--image_aspect_ratio",
-        "pad",
+        "--image_folder",
+        dataset_dir,
+        "--vision_tower",
+        model_path,  # Vision tower is integrated in LLaDA-V
+        # Vision-language configuration (from reference script)
         "--mm_tunable_parts",
         mm_tunable_parts,
         "--mm_projector_type",
         "mlp2x_gelu",
+        "--mm_vision_select_layer",
+        "-2",
+        "--mm_use_im_start_end",
+        "False",
+        "--mm_use_im_patch_token",
+        "False",
+        "--mm_patch_merge_type",
+        "spatial_unpad",
+        # Image processing (using simpler settings for LaTeX OCR)
+        "--image_aspect_ratio",
+        "pad",  # Simpler than anyres_max_4 for LaTeX equations
+        "--group_by_modality_length",
+        "True",
+        # Training hyperparameters
         "--output_dir",
         output_dir,
         "--num_train_epochs",
@@ -473,30 +558,45 @@ def train_llada(
         str(warmup_ratio),
         "--weight_decay",
         str(weight_decay),
+        "--lr_scheduler_type",
+        "cosine",
+        # Precision and optimization
         "--bf16",
         "True",
         "--tf32",
         "True",
         "--model_max_length",
-        "2048",
+        "2048",  # Shorter than 8192 for LaTeX (equations are typically short)
         "--gradient_checkpointing",
         "True",
+        "--attn_implementation",
+        "sdpa",
+        # Data loading
         "--dataloader_num_workers",
         "4",
         "--lazy_preprocess",
         "True",
-        "--report_to",
-        "wandb",
-        "--deepspeed",
-        f"/root/scripts/{deepspeed_config}.json",
+        "--dataloader_drop_last",
+        "True",
+        # Checkpointing and logging
+        "--save_strategy",
+        "steps",
         "--save_steps",
         str(save_steps),
         "--save_total_limit",
         "3",
         "--logging_steps",
         str(logging_steps),
-        "--attn_implementation",
-        "sdpa",
+        "--report_to",
+        "wandb",
+        # DeepSpeed
+        "--deepspeed",
+        f"/root/scripts/{deepspeed_config}.json",
+        # Additional settings from reference
+        "--evaluation_strategy",
+        "no",
+        "--use_conversation_mask",
+        "False",
     ]
 
     # Add LoRA flags if enabled
@@ -555,7 +655,7 @@ def train_llada(
 )
 def evaluate_model(
     checkpoint_path="/data/checkpoints/llada-latex-ocr",
-    dataset_path="/data/latex_ocr_dataset_validation",
+    dataset_path="/data/latex_ocr_dataset_validation/dataset.json",
     output_dir="/data/evaluation_results",
     max_samples: int = None,
     max_new_tokens: int = 512,
@@ -587,11 +687,9 @@ def evaluate_model(
     sys.path.insert(0, "/root")  # Critical for llava imports
 
     import torch
-    import json
     import numpy as np
     import warnings
     from tqdm import tqdm
-    from datasets import load_from_disk
     from datetime import datetime
 
     from llava.model.builder import load_pretrained_model
@@ -642,11 +740,17 @@ def evaluate_model(
     print(f"  Device: {device}")
     print(f"  Max length: {max_length}")
 
-    # Load dataset
+    # Load dataset from JSON
     print("\n[2/3] Loading dataset...")
-    dataset = load_from_disk(dataset_path)
+    import json
+    from pathlib import Path as PathLib
+
+    dataset_dir = str(PathLib(dataset_path).parent)
+    with open(dataset_path, "r") as f:
+        dataset = json.load(f)
+
     if max_samples:
-        dataset = dataset.select(range(min(max_samples, len(dataset))))
+        dataset = dataset[:max_samples]
 
     print(f"✓ Evaluating {len(dataset)} samples with batch_size={batch_size}")
 
@@ -659,7 +763,9 @@ def evaluate_model(
     from PIL import Image as PILImage
 
     # Process in batches
-    for batch_start in tqdm(range(0, len(dataset), batch_size), desc="Evaluating batches"):
+    for batch_start in tqdm(
+        range(0, len(dataset), batch_size), desc="Evaluating batches"
+    ):
         batch_end = min(batch_start + batch_size, len(dataset))
 
         try:
@@ -672,14 +778,12 @@ def evaluate_model(
             # Get individual samples from the batch
             for idx in range(batch_start, batch_end):
                 sample = dataset[idx]
-                image = sample["image"]
+                image_path_rel = sample["image"]
                 ground_truth = sample["conversations"][1]["value"]
 
-                # Ensure image is PIL Image
-                if not isinstance(image, PILImage.Image):
-                    image = PILImage.open(image).convert("RGB")
-                elif image.mode != "RGB":
-                    image = image.convert("RGB")
+                # Load image from file path (relative to dataset directory)
+                image_path_abs = os.path.join(dataset_dir, image_path_rel)
+                image = PILImage.open(image_path_abs).convert("RGB")
 
                 batch_images.append(image)
                 batch_ground_truths.append(ground_truth)
@@ -703,11 +807,14 @@ def evaluate_model(
             # Process images
             image_tensors = process_images(batch_images, image_processor, model.config)
             if image_tensors is None or len(image_tensors) == 0:
-                print(f"  Warning: process_images returned None for batch starting at {batch_start}")
+                print(
+                    f"  Warning: process_images returned None for batch starting at {batch_start}"
+                )
                 continue
 
             image_tensors = [
-                _image.to(dtype=torch.float16, device=device) for _image in image_tensors
+                _image.to(dtype=torch.float16, device=device)
+                for _image in image_tensors
             ]
 
             # Generate for batch
@@ -728,10 +835,12 @@ def evaluate_model(
                 print(f"  Debug: num samples in batch = {len(batch_ground_truths)}")
 
             # Decode each output in the batch
-            for i, (output, ground_truth, sample_id) in enumerate(zip(output_ids, batch_ground_truths, batch_ids)):
+            for output, ground_truth, sample_id in zip(
+                output_ids, batch_ground_truths, batch_ids
+            ):
                 try:
                     prediction = tokenizer.decode(
-                        output[batch_input_ids.shape[1]:], skip_special_tokens=True
+                        output[batch_input_ids.shape[1] :], skip_special_tokens=True
                     ).strip()
 
                     # Calculate metrics
@@ -753,16 +862,18 @@ def evaluate_model(
                     cer_scores.append(cer_v)
                     wer_scores.append(wer_v)
 
-                    results.append({
-                        "id": sample_id,
-                        "ground_truth": ground_truth,
-                        "prediction": prediction,
-                        "exact_match": is_exact,
-                        "bleu": bleu,
-                        "edit_distance": ed,
-                        "cer": cer_v,
-                        "wer": wer_v,
-                    })
+                    results.append(
+                        {
+                            "id": sample_id,
+                            "ground_truth": ground_truth,
+                            "prediction": prediction,
+                            "exact_match": is_exact,
+                            "bleu": bleu,
+                            "edit_distance": ed,
+                            "cer": cer_v,
+                            "wer": wer_v,
+                        }
+                    )
                 except Exception as e:
                     print(f"  Error processing sample {sample_id}: {e}")
                     continue
@@ -770,11 +881,14 @@ def evaluate_model(
             # Print progress
             if len(results) % 20 == 0 and len(results) > 0:
                 current_acc = exact_matches / len(results) * 100
-                print(f"  Progress: {len(results)}/{len(dataset)} | Exact Match: {current_acc:.2f}%")
+                print(
+                    f"  Progress: {len(results)}/{len(dataset)} | Exact Match: {current_acc:.2f}%"
+                )
 
         except Exception as e:
             print(f"Error on batch starting at {batch_start}: {e}")
             import traceback
+
             traceback.print_exc()
             continue
 
@@ -786,7 +900,7 @@ def evaluate_model(
         print("No valid predictions were generated.")
         return {
             "status": "failed",
-            "error": "All samples failed - no results to evaluate"
+            "error": "All samples failed - no results to evaluate",
         }
 
     metrics = {
@@ -900,7 +1014,7 @@ def inference_finetuned(
             checkpoint_path = os.path.join(checkpoint_path, latest_checkpoint)
             print(f"Using latest checkpoint: {latest_checkpoint}")
 
-    tokenizer, model, image_processor, max_length = load_pretrained_model(
+    tokenizer, model, image_processor, _ = load_pretrained_model(
         checkpoint_path,
         None,
         "llava_llada",
@@ -913,7 +1027,7 @@ def inference_finetuned(
     # Load image
     print("\n[2/3] Loading image...")
     if image_data and image_data.startswith("data:image"):
-        header, encoded = image_data.split(",", 1)
+        _, encoded = image_data.split(",", 1)
         image_bytes = base64.b64decode(encoded)
         image = PILImage.open(BytesIO(image_bytes)).convert("RGB")
         print("✓ Loaded from base64 data")
