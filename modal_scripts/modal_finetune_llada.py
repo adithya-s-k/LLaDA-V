@@ -69,6 +69,7 @@ image = (
     )
     .uv_pip_install(
         # Core training dependencies from pyproject.toml [train]
+        "deepspeed==0.14.4",  # Optional: only used if --deepspeed-config is specified
         "peft==0.9.0",
         "accelerate==0.29.1",
         "transformers",
@@ -430,9 +431,12 @@ def train_llada(
     lora_r=64,
     lora_alpha=16,
     lora_dropout=0.05,
+    # DeepSpeed configuration (optional - only use for multi-GPU training)
+    deepspeed_config=None,  # None = no DeepSpeed, "zero2" or "zero3" = enable DeepSpeed
     # Other settings
     save_steps=500,
     logging_steps=10,
+    logging_nan_inf_filter=False,  # Log all values including NaN/Inf for debugging
 ):
     """
     Train LLaDA-V on LaTeX OCR dataset.
@@ -455,6 +459,7 @@ def train_llada(
         lora_r: LoRA rank (only used if use_lora=True)
         lora_alpha: LoRA alpha (only used if use_lora=True)
         lora_dropout: LoRA dropout (only used if use_lora=True)
+        deepspeed_config: DeepSpeed config name (None=disabled, "zero2" or "zero3"=enabled)
 
     Returns:
         Dict with status and output directory
@@ -488,6 +493,7 @@ def train_llada(
     print("LLADA-V FINE-TUNING ON LATEX OCR")
     print("=" * 80)
     print(f"Training mode: {'LoRA' if use_lora else 'Full fine-tuning'}")
+    print(f"DeepSpeed: {'Enabled (' + deepspeed_config + ')' if deepspeed_config else 'Disabled (single-GPU)'}")
     print(f"Tunable components: {mm_tunable_parts}")
     print(f"Dataset: {dataset_path}")
     print(f"Model: {model_path}")
@@ -495,6 +501,7 @@ def train_llada(
     print(f"Epochs: {num_train_epochs}")
     print(f"Batch size: {per_device_train_batch_size}")
     print(f"Gradient accumulation: {gradient_accumulation_steps}")
+    print(f"Effective batch size: {per_device_train_batch_size * gradient_accumulation_steps}")
     print(f"Learning rate: {learning_rate}")
     if use_lora:
         print(f"LoRA rank: {lora_r}, alpha: {lora_alpha}, dropout: {lora_dropout}")
@@ -604,12 +611,33 @@ def train_llada(
         str(logging_steps),
         "--report_to",
         "wandb",
+        # Logging configuration for better WandB metrics
+        "--logging_nan_inf_filter",
+        str(logging_nan_inf_filter),
+        "--logging_first_step",
+        "True",
         # Additional settings from reference
         "--evaluation_strategy",
         "no",
         "--use_conversation_mask",
         "False",
     ]
+
+    # Add DeepSpeed flag if enabled
+    if deepspeed_config:
+        deepspeed_config_path = f"/root/scripts/{deepspeed_config}.json"
+        if not os.path.exists(deepspeed_config_path):
+            raise FileNotFoundError(
+                f"DeepSpeed config not found: {deepspeed_config_path}\n"
+                f"Available configs: zero2.json, zero3.json, zero2_offload.json, zero3_offload.json"
+            )
+        command.extend([
+            "--deepspeed",
+            deepspeed_config_path,
+        ])
+        print(f"DeepSpeed enabled with config: {deepspeed_config_path}")
+    else:
+        print("DeepSpeed disabled - using standard PyTorch training")
 
     # Add LoRA flags if enabled
     if use_lora:
