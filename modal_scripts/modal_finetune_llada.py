@@ -69,7 +69,6 @@ image = (
     )
     .uv_pip_install(
         # Core training dependencies from pyproject.toml [train]
-        "deepspeed==0.14.4",
         "peft==0.9.0",
         "accelerate==0.29.1",
         "transformers",
@@ -431,9 +430,6 @@ def train_llada(
     lora_r=64,
     lora_alpha=16,
     lora_dropout=0.05,
-    # DeepSpeed configuration
-    # deepspeed_config="zero3",  # "zero3" recommended for LoRA (best practice from Bunny)
-    deepspeed_config="zero2",  # "zero2" for full fine-tuning (more stable)
     # Other settings
     save_steps=500,
     logging_steps=10,
@@ -459,7 +455,6 @@ def train_llada(
         lora_r: LoRA rank (only used if use_lora=True)
         lora_alpha: LoRA alpha (only used if use_lora=True)
         lora_dropout: LoRA dropout (only used if use_lora=True)
-        deepspeed_config: DeepSpeed configuration ("zero3" recommended for LoRA, "zero2" for pretraining)
 
     Returns:
         Dict with status and output directory
@@ -473,6 +468,21 @@ def train_llada(
     # Fix MPI/PMIx shared memory issues in containers
     os.environ["PMIX_MCA_gds"] = "hash"
     os.environ["OMPI_MCA_btl_vader_single_copy_mechanism"] = "none"
+
+    # Optimize batch size for training mode to prevent OOM on A100-80GB
+    # The model uses ~77-79GB even with LoRA, so we need smaller batches
+    if per_device_train_batch_size > 2:
+        original_batch_size = per_device_train_batch_size
+        if use_lora:
+            per_device_train_batch_size = 2  # LoRA: reduce to 2
+        else:
+            per_device_train_batch_size = 1  # Full fine-tuning: reduce to 1
+        print(
+            f"Note: Reducing batch size from {original_batch_size} to {per_device_train_batch_size} "
+            f"for {'LoRA' if use_lora else 'full fine-tuning'} to prevent OOM on A100-80GB"
+        )
+        print(f"Effective batch size maintained at {per_device_train_batch_size * gradient_accumulation_steps} "
+              f"via gradient accumulation")
 
     print("=" * 80)
     print("LLADA-V FINE-TUNING ON LATEX OCR")
@@ -506,37 +516,6 @@ def train_llada(
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-
-    # Validate DeepSpeed config has optimizer section
-    import json as json_module
-
-    deepspeed_config_path = f"/root/scripts/{deepspeed_config}.json"
-
-    if os.path.exists(deepspeed_config_path):
-        with open(deepspeed_config_path, "r") as f:
-            ds_config = json_module.load(f)
-
-        if "optimizer" not in ds_config:
-            print("=" * 80)
-            print("ERROR: DeepSpeed config missing 'optimizer' section!")
-            print(f"Config file: {deepspeed_config_path}")
-            print()
-            print(
-                "This will cause 'AttributeError: DummyOptim object has no attribute step'"
-            )
-            print()
-            print("Recommended fixes:")
-            print("  1. Add optimizer config to the DeepSpeed JSON file")
-            print("  2. Use a config that has optimizer: zero2, zero3_offload, zero3pp")
-            if use_lora:
-                print("  3. For LoRA: Use --deepspeed-config zero3 (default)")
-            print("=" * 80)
-            raise ValueError(
-                f"DeepSpeed config '{deepspeed_config}.json' is missing 'optimizer' section. "
-                "Training cannot proceed without a valid optimizer configuration."
-            )
-    else:
-        print(f"Warning: DeepSpeed config not found at {deepspeed_config_path}")
 
     # Build training command based on llada_v_finetune.sh
     # Extract image folder from dataset path (parent directory of JSON file)
@@ -604,6 +583,9 @@ def train_llada(
         "True",
         "--attn_implementation",
         "sdpa",
+        # Memory optimization: Use 8-bit AdamW to reduce optimizer memory usage
+        "--optim",
+        "adamw_8bit",
         # Data loading
         "--dataloader_num_workers",
         "4",
@@ -622,9 +604,6 @@ def train_llada(
         str(logging_steps),
         "--report_to",
         "wandb",
-        # DeepSpeed
-        "--deepspeed",
-        f"/root/scripts/{deepspeed_config}.json",
         # Additional settings from reference
         "--evaluation_strategy",
         "no",

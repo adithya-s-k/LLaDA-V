@@ -39,7 +39,14 @@ import torch
 
 import transformers
 import tokenizers
-import deepspeed
+
+# Make DeepSpeed optional for single-GPU training
+try:
+    import deepspeed
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
+    deepspeed = None
 
 from transformers import AutoConfig
 from torch.utils.data import Dataset
@@ -195,16 +202,20 @@ class TrainingArguments(transformers.TrainingArguments):
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
-    from deepspeed import zero
-    from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
+    if DEEPSPEED_AVAILABLE:
+        from deepspeed import zero
+        from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 
-    if hasattr(param, "ds_id"):
-        if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
-            if not ignore_status:
-                logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
-        with zero.GatheredParameters([param]):
-            param = param.data.detach().cpu().clone()
+        if hasattr(param, "ds_id"):
+            if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
+                if not ignore_status:
+                    logging.warning(f"{name}: param.ds_status != ZeroParamStatus.NOT_AVAILABLE: {param.ds_status}")
+            with zero.GatheredParameters([param]):
+                param = param.data.detach().cpu().clone()
+        else:
+            param = param.detach().cpu().clone()
     else:
+        # No DeepSpeed - just clone the parameter directly
         param = param.detach().cpu().clone()
     return param
 
@@ -298,7 +309,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
                 torch.save(weight_to_save, os.path.join(output_dir, f"mm_projector.bin"))
         return
 
-    if trainer.deepspeed:
+    if DEEPSPEED_AVAILABLE and hasattr(trainer, 'deepspeed') and trainer.deepspeed:
         trainer.save_model(output_dir)
         return
 
@@ -1683,7 +1694,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
             )
             from transformers.models.mixtral.modeling_mixtral import MixtralSparseMoeBlock
 
-            deepspeed.utils.set_z3_leaf_modules(model, [MixtralSparseMoeBlock])
+            if DEEPSPEED_AVAILABLE:
+                deepspeed.utils.set_z3_leaf_modules(model, [MixtralSparseMoeBlock])
         elif "mistral" in model_args.model_name_or_path.lower() or "zephyr" in model_args.model_name_or_path.lower():
             model = LlavaMistralForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
@@ -1721,7 +1733,8 @@ def get_model(model_args, training_args, bnb_model_from_pretrained_args):
                 )
                 from transformers.models.qwen2_moe.modeling_qwen2_moe import Qwen2MoeSparseMoeBlock
 
-                deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
+                if DEEPSPEED_AVAILABLE:
+                    deepspeed.utils.set_z3_leaf_modules(model, [Qwen2MoeSparseMoeBlock])
             else:
                 model = LlavaQwenForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
