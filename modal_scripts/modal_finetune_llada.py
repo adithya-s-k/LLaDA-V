@@ -405,6 +405,54 @@ def download_model(force_redownload: bool = False):
 # ==============================================================================
 
 
+def patch_transformers_for_pytorch26():
+    """
+    Patch transformers trainer for PyTorch 2.6+ compatibility.
+
+    PyTorch 2.6+ defaults to weights_only=True in torch.load(), which breaks
+    RNG state loading during checkpoint resumption. This patch fixes it.
+    """
+    import site
+    from pathlib import Path
+
+    # Find transformers installation
+    site_packages = site.getsitepackages()
+    trainer_file = None
+
+    for sp in site_packages:
+        candidate = Path(sp) / "transformers" / "trainer.py"
+        if candidate.exists():
+            trainer_file = str(candidate)
+            break
+
+    if not trainer_file:
+        print("Warning: Could not find transformers/trainer.py to patch")
+        return False
+
+    # Apply patch
+    with open(trainer_file, "r") as f:
+        content = f.read()
+
+    # Check if already patched
+    if "weights_only=False" in content:
+        print("✓ transformers/trainer.py already patched")
+        return True
+
+    # Patch the RNG state loading line
+    original = "checkpoint_rng_state = torch.load(rng_file)"
+    patched = "checkpoint_rng_state = torch.load(rng_file, weights_only=False)"
+
+    if original in content:
+        content = content.replace(original, patched)
+        with open(trainer_file, "w") as f:
+            f.write(content)
+        print("✓ Patched transformers/trainer.py for PyTorch 2.6+ compatibility")
+        return True
+    else:
+        print("Warning: Could not find target line in transformers/trainer.py")
+        return False
+
+
 @app.function(
     image=image,
     gpu="A100-80GB",
@@ -474,6 +522,21 @@ def train_llada(
     os.environ["PMIX_MCA_gds"] = "hash"
     os.environ["OMPI_MCA_btl_vader_single_copy_mechanism"] = "none"
 
+    # Patch transformers for PyTorch 2.6+ checkpoint resumption compatibility
+    patch_transformers_for_pytorch26()
+
+    # Register numpy safe globals for torch serialization
+    import torch
+
+    try:
+        torch.serialization.add_safe_globals(["numpy._core.multiarray._reconstruct"])
+        torch.serialization.add_safe_globals(
+            ["numpy.core.multiarray._reconstruct"]
+        )  # Legacy numpy
+    except AttributeError:
+        # PyTorch < 2.6 doesn't have add_safe_globals
+        pass
+
     # Optimize batch size for training mode to prevent OOM on A100-80GB
     # The model uses ~77-79GB even with LoRA, so we need smaller batches
     if per_device_train_batch_size > 2:
@@ -486,14 +549,18 @@ def train_llada(
             f"Note: Reducing batch size from {original_batch_size} to {per_device_train_batch_size} "
             f"for {'LoRA' if use_lora else 'full fine-tuning'} to prevent OOM on A100-80GB"
         )
-        print(f"Effective batch size maintained at {per_device_train_batch_size * gradient_accumulation_steps} "
-              f"via gradient accumulation")
+        print(
+            f"Effective batch size maintained at {per_device_train_batch_size * gradient_accumulation_steps} "
+            f"via gradient accumulation"
+        )
 
     print("=" * 80)
     print("LLADA-V FINE-TUNING ON LATEX OCR")
     print("=" * 80)
     print(f"Training mode: {'LoRA' if use_lora else 'Full fine-tuning'}")
-    print(f"DeepSpeed: {'Enabled (' + deepspeed_config + ')' if deepspeed_config else 'Disabled (single-GPU)'}")
+    print(
+        f"DeepSpeed: {'Enabled (' + deepspeed_config + ')' if deepspeed_config else 'Disabled (single-GPU)'}"
+    )
     print(f"Tunable components: {mm_tunable_parts}")
     print(f"Dataset: {dataset_path}")
     print(f"Model: {model_path}")
@@ -501,7 +568,9 @@ def train_llada(
     print(f"Epochs: {num_train_epochs}")
     print(f"Batch size: {per_device_train_batch_size}")
     print(f"Gradient accumulation: {gradient_accumulation_steps}")
-    print(f"Effective batch size: {per_device_train_batch_size * gradient_accumulation_steps}")
+    print(
+        f"Effective batch size: {per_device_train_batch_size * gradient_accumulation_steps}"
+    )
     print(f"Learning rate: {learning_rate}")
     if use_lora:
         print(f"LoRA rank: {lora_r}, alpha: {lora_alpha}, dropout: {lora_dropout}")
@@ -523,6 +592,19 @@ def train_llada(
 
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
+
+    # Check if we'll be resuming from a checkpoint
+    checkpoint_dirs = [
+        d
+        for d in os.listdir(output_dir)
+        if d.startswith("checkpoint-") and os.path.isdir(os.path.join(output_dir, d))
+    ]
+    if checkpoint_dirs:
+        checkpoint_dirs.sort(key=lambda x: int(x.split("-")[1]))
+        latest_checkpoint = checkpoint_dirs[-1]
+        print(f"📍 Found existing checkpoints - will resume from: {latest_checkpoint}")
+    else:
+        print("📍 No existing checkpoints - starting fresh training")
 
     # Build training command based on llada_v_finetune.sh
     # Extract image folder from dataset path (parent directory of JSON file)
@@ -631,10 +713,12 @@ def train_llada(
                 f"DeepSpeed config not found: {deepspeed_config_path}\n"
                 f"Available configs: zero2.json, zero3.json, zero2_offload.json, zero3_offload.json"
             )
-        command.extend([
-            "--deepspeed",
-            deepspeed_config_path,
-        ])
+        command.extend(
+            [
+                "--deepspeed",
+                deepspeed_config_path,
+            ]
+        )
         print(f"DeepSpeed enabled with config: {deepspeed_config_path}")
     else:
         print("DeepSpeed disabled - using standard PyTorch training")
@@ -682,6 +766,253 @@ def train_llada(
 
 
 # ==============================================================================
+# MERGE LORA CHECKPOINT
+# ==============================================================================
+
+
+@app.function(
+    image=image,
+    gpu="L40s",
+    volumes={"/data": volume},
+    timeout=2 * HOURS,
+    secrets=[huggingface_secret],
+)
+def merge_lora_checkpoint(
+    checkpoint_path: str = "/data/checkpoints/llada-latex-ocr/checkpoint-500",
+    base_model_path: str = "/data/models/LLaDA-V",
+    output_path: str = None,
+    huggingface_repo_id: str = None,
+    private: bool = True,
+):
+    """
+    Merge LoRA adapters with base model and optionally push to HuggingFace Hub.
+
+    Args:
+        checkpoint_path: Path to LoRA checkpoint directory
+        base_model_path: Path to base LLaDA-V model
+        output_path: Output directory for merged model (default: checkpoint-{N}-merged)
+        huggingface_repo_id: HuggingFace repo ID to push to (e.g., "username/model-name")
+        private: Whether to make HuggingFace repo private
+
+    Returns:
+        Dict with status, output_path, and optional hub_url
+    """
+    import sys
+
+    sys.path.insert(0, "/root")
+
+    import warnings
+    import torch
+    from peft import PeftModel
+    from llava.model.builder import load_pretrained_model
+    from huggingface_hub import HfApi
+    import shutil
+
+    # Suppress PyTorch meta tensor warnings during model loading
+    warnings.filterwarnings("ignore", message=".*copying from a non-meta parameter.*")
+    warnings.filterwarnings(
+        "ignore", category=UserWarning, module="torch.nn.modules.module"
+    )
+
+    # Auto-generate output path if not specified
+    if output_path is None:
+        checkpoint_name = os.path.basename(checkpoint_path.rstrip("/"))
+        parent_dir = os.path.dirname(checkpoint_path.rstrip("/"))
+        output_path = os.path.join(parent_dir, f"{checkpoint_name}-merged")
+        print(f"Auto-generated output path: {output_path}")
+
+    print("=" * 80)
+    print("MERGE LORA CHECKPOINT")
+    print("=" * 80)
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Base model: {base_model_path}")
+    print(f"Output: {output_path}")
+    if huggingface_repo_id:
+        print(f"HuggingFace repo: {huggingface_repo_id} (private={private})")
+    print("=" * 80)
+    print()
+
+    # Verify paths
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if not os.path.exists(base_model_path):
+        raise FileNotFoundError(f"Base model not found: {base_model_path}")
+    if not os.path.exists(os.path.join(checkpoint_path, "adapter_config.json")):
+        raise ValueError(
+            f"Not a LoRA checkpoint (missing adapter_config.json): {checkpoint_path}"
+        )
+
+    # Load base model
+    print("[1/5] Loading base model...")
+    tokenizer, model, image_processor, max_length = load_pretrained_model(
+        base_model_path,
+        None,
+        "llava_llada",
+        attn_implementation="sdpa",
+        device_map="auto",
+    )
+    print(f"✓ Base model loaded (max_length={max_length})")
+
+    # Load LoRA adapters
+    print("\n[2/5] Loading LoRA adapters...")
+    model = PeftModel.from_pretrained(model, checkpoint_path)
+    print("✓ LoRA adapters loaded")
+
+    # Merge and unload
+    print("\n[3/5] Merging LoRA weights into base model...")
+    merged_model = model.merge_and_unload()
+    print("✓ LoRA weights merged")
+
+    # Save merged model
+    print(f"\n[4/5] Saving merged model to {output_path}...")
+    os.makedirs(output_path, exist_ok=True)
+
+    # Save model weights
+    merged_model.save_pretrained(
+        output_path,
+        safe_serialization=True,
+        max_shard_size="2GB",
+    )
+
+    # Save tokenizer
+    tokenizer.save_pretrained(output_path)
+
+    # Copy generation config if exists
+    gen_config_src = os.path.join(base_model_path, "generation_config.json")
+    if os.path.exists(gen_config_src):
+        shutil.copy(gen_config_src, output_path)
+
+    # Copy custom config files (for llava_llada architecture)
+    for config_file in ["configuration_llada.py"]:
+        config_src = os.path.join(base_model_path, config_file)
+        if os.path.exists(config_src):
+            shutil.copy(config_src, output_path)
+
+    volume.commit()
+    print("✓ Merged model saved")
+
+    # Push to HuggingFace Hub if requested
+    hub_url = None
+    if huggingface_repo_id:
+        print(f"\n[5/5] Pushing to HuggingFace Hub: {huggingface_repo_id}...")
+        os.environ["HF_TOKEN"] = os.environ.get("HUGGINGFACE_TOKEN", "")
+
+        try:
+            # Create model card
+            model_card = f"""---
+tags:
+- vision
+- image-text-to-text
+- llava
+- latex
+- ocr
+library_name: transformers
+pipeline_tag: image-text-to-text
+---
+
+# LLaDA-V Fine-tuned for LaTeX OCR
+
+This model is a fine-tuned version of [GSAI-ML/LLaDA-V](https://huggingface.co/GSAI-ML/LLaDA-V) for LaTeX OCR tasks.
+
+## Training Details
+
+- **Base Model**: GSAI-ML/LLaDA-V
+- **Fine-tuning Method**: LoRA
+- **Dataset**: LaTeX OCR equations
+- **Checkpoint**: {os.path.basename(checkpoint_path)}
+
+## Usage
+
+```python
+from llava.model.builder import load_pretrained_model
+from llava.mm_utils import process_images, tokenizer_image_token
+from llava.constants import IMAGE_TOKEN_INDEX
+from PIL import Image
+import torch
+
+# Load model
+tokenizer, model, image_processor, _ = load_pretrained_model(
+    "{huggingface_repo_id}",
+    None,
+    "llava_llada",
+    device_map="auto",
+)
+
+# Load and process image
+image = Image.open("equation.png")
+text = "<image>\\nConvert this mathematical expression to LaTeX code."
+input_ids = tokenizer_image_token(text, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+image_tensor = process_images([image], image_processor, model.config)
+
+# Generate
+with torch.no_grad():
+    output = model.generate(
+        input_ids=input_ids.unsqueeze(0).cuda(),
+        images=image_tensor.cuda(),
+        max_new_tokens=512,
+    )
+latex = tokenizer.decode(output[0], skip_special_tokens=True)
+print(latex)
+```
+
+## Model Details
+
+- **Architecture**: LLaDA-V (Diffusion-based Vision-Language Model)
+- **Vision Encoder**: SigLIP-SO400M
+- **Language Model**: LLaDA-8B
+- **Training**: LoRA fine-tuning merged into base weights
+"""
+
+            # Save model card
+            with open(os.path.join(output_path, "README.md"), "w") as f:
+                f.write(model_card)
+
+            # Push to hub
+            merged_model.push_to_hub(
+                huggingface_repo_id,
+                private=private,
+                token=os.environ["HF_TOKEN"],
+            )
+            tokenizer.push_to_hub(
+                huggingface_repo_id,
+                private=private,
+                token=os.environ["HF_TOKEN"],
+            )
+
+            # Push additional files
+            api = HfApi()
+            for filename in ["generation_config.json", "configuration_llada.py"]:
+                filepath = os.path.join(output_path, filename)
+                if os.path.exists(filepath):
+                    api.upload_file(
+                        path_or_fileobj=filepath,
+                        path_in_repo=filename,
+                        repo_id=huggingface_repo_id,
+                        token=os.environ["HF_TOKEN"],
+                    )
+
+            hub_url = f"https://huggingface.co/{huggingface_repo_id}"
+            print(f"✓ Pushed to HuggingFace Hub: {hub_url}")
+
+        except Exception as e:
+            print(f"✗ Failed to push to HuggingFace Hub: {e}")
+            print("Model saved locally, but Hub upload failed")
+
+    print("\n" + "=" * 80)
+    print("✓ MERGE COMPLETED")
+    print("=" * 80)
+    print(f"Merged model: {output_path}")
+    if hub_url:
+        print(f"HuggingFace: {hub_url}")
+
+    return {
+        "status": "completed",
+        "output_path": output_path,
+        "hub_url": hub_url,
+    }
+
+
+# ==============================================================================
 # EVALUATION
 # ==============================================================================
 
@@ -694,15 +1025,18 @@ def train_llada(
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def evaluate_model(
-    checkpoint_path="/data/checkpoints/llada-latex-ocr",
+    model_path="/data/checkpoints/llada-latex-ocr",
     dataset_path="/data/latex_ocr_dataset_validation/dataset.json",
     output_dir="/data/evaluation_results",
-    max_samples: int = None,
+    max_samples: int = 5,
     max_new_tokens: int = 512,
-    batch_size: int = 4,  # Number of samples to process at once
+    batch_size: int = 1,  # Number of samples to process at once
 ):
     """
     Evaluate fine-tuned LLaDA-V model on validation set.
+
+    RECOMMENDED: Merge LoRA checkpoints before evaluation using merge_lora_checkpoint().
+    This function works best with merged models or HuggingFace repos.
 
     Calculates metrics:
     - Exact Match Accuracy
@@ -712,12 +1046,13 @@ def evaluate_model(
     - Edit Distance (Levenshtein)
 
     Args:
-        checkpoint_path: Path to fine-tuned checkpoint
+        model_path: Path to merged model or HuggingFace repo ID
+                   (For LoRA checkpoints, merge first using merge_lora_checkpoint)
         dataset_path: Path to validation dataset
         output_dir: Directory to save evaluation results
         max_samples: Maximum samples to evaluate (None for all)
         max_new_tokens: Maximum tokens to generate
-        batch_size: Number of samples to process at once (default=4 for speed)
+        batch_size: Number of samples to process at once (default=1 for stability)
 
     Returns:
         Dict with metrics and results file path
@@ -745,38 +1080,73 @@ def evaluate_model(
     print("=" * 80)
     print("LLADA-V MODEL EVALUATION")
     print("=" * 80)
-    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Model: {model_path}")
     print(f"Dataset: {dataset_path}")
     print(f"Device: {device}")
     print()
 
-    # Load model
+    # Load model with smart detection
     print("[1/3] Loading model...")
 
-    # Find latest checkpoint if directory contains multiple
-    if os.path.exists(checkpoint_path):
-        checkpoint_dirs = [
-            d
-            for d in os.listdir(checkpoint_path)
-            if d.startswith("checkpoint-")
-            and os.path.isdir(os.path.join(checkpoint_path, d))
-        ]
-        if checkpoint_dirs:
-            checkpoint_dirs.sort(key=lambda x: int(x.split("-")[1]))
-            latest_checkpoint = checkpoint_dirs[-1]
-            checkpoint_path = os.path.join(checkpoint_path, latest_checkpoint)
-            print(f"Using latest checkpoint: {latest_checkpoint}")
+    # Auto-detect model type and load accordingly
+    model_type = None
+    base_model_path = "/data/models/LLaDA-V"
 
-    tokenizer, model, image_processor, max_length = load_pretrained_model(
-        checkpoint_path,
-        None,  # No model_base needed for fine-tuned checkpoint
-        "llava_llada",
-        attn_implementation="sdpa",  # Use SDPA instead of Flash Attention 2
-        device_map=device,
-    )
+    if os.path.exists(model_path):
+        # Local path - check if it's a directory with checkpoints
+        if os.path.isdir(model_path):
+            checkpoint_dirs = [
+                d
+                for d in os.listdir(model_path)
+                if d.startswith("checkpoint-")
+                and os.path.isdir(os.path.join(model_path, d))
+            ]
+            if checkpoint_dirs:
+                # Has checkpoint subdirectories - use latest
+                checkpoint_dirs.sort(key=lambda x: int(x.split("-")[1]))
+                latest_checkpoint = checkpoint_dirs[-1]
+                model_path = os.path.join(model_path, latest_checkpoint)
+                print(f"Auto-selected latest checkpoint: {latest_checkpoint}")
+
+        # Check if it's a LoRA checkpoint
+        if os.path.exists(os.path.join(model_path, "adapter_config.json")):
+            model_type = "lora"
+            print("Detected LoRA checkpoint")
+            print(f"  Loading base model: {base_model_path}")
+            print(f"  Loading LoRA adapters: {model_path}")
+        else:
+            model_type = "merged"
+            print("Detected merged/full model")
+    else:
+        # Not a local path - assume HuggingFace Hub repo
+        model_type = "huggingface"
+        print(f"Loading from HuggingFace Hub: {model_path}")
+
+    # Load model based on type
+    if model_type == "lora":
+        # Load base model + LoRA adapters
+        # Note: model_name must include "lora" to trigger LoRA loading path
+        tokenizer, model, image_processor, max_length = load_pretrained_model(
+            model_path,  # LoRA checkpoint path
+            base_model_path,  # Base model path
+            "lora-llava-llada",  # Must include "lora" in name
+            attn_implementation="sdpa",
+            device_map=device,
+        )
+    else:
+        # Load merged model or HuggingFace model
+        tokenizer, model, image_processor, max_length = load_pretrained_model(
+            model_path,
+            None,
+            "llava_llada",
+            attn_implementation="sdpa",
+            device_map=device,
+        )
+
     model.eval()
 
     print("✓ Model loaded")
+    print(f"  Type: {model_type}")
     print(f"  Device: {device}")
     print(f"  Max length: {max_length}")
 
@@ -944,7 +1314,8 @@ def evaluate_model(
         }
 
     metrics = {
-        "checkpoint": checkpoint_path,
+        "model": model_path,
+        "model_type": model_type,
         "total_samples": total,
         "exact_match_accuracy": exact_matches / total * 100,
         "bleu_score_mean": float(np.mean(bleu_scores)),
@@ -1003,16 +1374,18 @@ def evaluate_model(
 def inference_finetuned(
     image_path: str = None,
     image_data: str = None,
-    checkpoint_path="/data/checkpoints/llada-latex-ocr",
+    model_path="/data/checkpoints/llada-latex-ocr",
     max_new_tokens: int = 512,
 ):
     """
     Run inference with fine-tuned LLaDA-V model.
 
+    Automatically detects model type (LoRA checkpoint, merged model, or HuggingFace repo).
+
     Args:
         image_path: Path to image file
         image_data: Base64-encoded image data
-        checkpoint_path: Path to fine-tuned checkpoint
+        model_path: Path to model (LoRA checkpoint, merged model, or HuggingFace repo ID)
         max_new_tokens: Maximum tokens to generate
 
     Returns:
@@ -1036,33 +1409,67 @@ def inference_finetuned(
     print("=" * 80)
     print("FINE-TUNED LLADA-V INFERENCE")
     print("=" * 80)
+    print(f"Model: {model_path}")
+    print()
 
-    # Load model
+    # Load model with smart detection
     print("[1/3] Loading model...")
 
-    # Find latest checkpoint if directory contains multiple
-    if os.path.exists(checkpoint_path):
-        checkpoint_dirs = [
-            d
-            for d in os.listdir(checkpoint_path)
-            if d.startswith("checkpoint-")
-            and os.path.isdir(os.path.join(checkpoint_path, d))
-        ]
-        if checkpoint_dirs:
-            checkpoint_dirs.sort(key=lambda x: int(x.split("-")[1]))
-            latest_checkpoint = checkpoint_dirs[-1]
-            checkpoint_path = os.path.join(checkpoint_path, latest_checkpoint)
-            print(f"Using latest checkpoint: {latest_checkpoint}")
+    # Auto-detect model type and load accordingly
+    model_type = None
+    base_model_path = "/data/models/LLaDA-V"
 
-    tokenizer, model, image_processor, _ = load_pretrained_model(
-        checkpoint_path,
-        None,
-        "llava_llada",
-        attn_implementation="sdpa",  # Use SDPA instead of Flash Attention 2
-        device_map=device,
-    )
+    if os.path.exists(model_path):
+        # Local path - check if it's a directory with checkpoints
+        if os.path.isdir(model_path):
+            checkpoint_dirs = [
+                d
+                for d in os.listdir(model_path)
+                if d.startswith("checkpoint-")
+                and os.path.isdir(os.path.join(model_path, d))
+            ]
+            if checkpoint_dirs:
+                # Has checkpoint subdirectories - use latest
+                checkpoint_dirs.sort(key=lambda x: int(x.split("-")[1]))
+                latest_checkpoint = checkpoint_dirs[-1]
+                model_path = os.path.join(model_path, latest_checkpoint)
+                print(f"Auto-selected latest checkpoint: {latest_checkpoint}")
+
+        # Check if it's a LoRA checkpoint
+        if os.path.exists(os.path.join(model_path, "adapter_config.json")):
+            model_type = "lora"
+            print("Detected LoRA checkpoint")
+        else:
+            model_type = "merged"
+            print("Detected merged/full model")
+    else:
+        # Not a local path - assume HuggingFace Hub repo
+        model_type = "huggingface"
+        print(f"Loading from HuggingFace Hub: {model_path}")
+
+    # Load model based on type
+    if model_type == "lora":
+        # Load base model + LoRA adapters
+        # Note: model_name must include "lora" to trigger LoRA loading path
+        tokenizer, model, image_processor, _ = load_pretrained_model(
+            model_path,  # LoRA checkpoint path
+            base_model_path,  # Base model path
+            "lora-llava-llada",  # Must include "lora" in name
+            attn_implementation="sdpa",
+            device_map=device,
+        )
+    else:
+        # Load merged model or HuggingFace model
+        tokenizer, model, image_processor, _ = load_pretrained_model(
+            model_path,
+            None,
+            "llava_llada",
+            attn_implementation="sdpa",
+            device_map=device,
+        )
+
     model.eval()
-    print(f"✓ Model loaded on {device}")
+    print(f"✓ Model loaded ({model_type}) on {device}")
 
     # Load image
     print("\n[2/3] Loading image...")
@@ -1115,56 +1522,88 @@ def inference_finetuned(
     return {
         "status": "success",
         "latex": latex,
-        "checkpoint": checkpoint_path,
+        "model": model_path,
+        "model_type": model_type,
         "image_size": image.size,
     }
 
 
-# ==============================================================================
-# CLI ENTRYPOINTS
-# ==============================================================================
-
-
-@app.local_entrypoint()
-def main():
-    """
-    Main CLI entrypoint with usage instructions.
-    """
-    print("""
+"""
 LLaDA-V Fine-tuning Pipeline
 ============================
 
+Complete workflow for fine-tuning LLaDA-V on LaTeX OCR dataset.
+
 Step 1: Download and prepare dataset
-  # Full training dataset
-  modal run modal_finetune_llada.py::download_and_prepare_dataset
+-------------------------------------
+# Full training dataset
+modal run modal_finetune_llada.py::download_and_prepare_dataset
 
-  # Validation dataset
-  modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation
+# Validation dataset
+modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation
 
-  # Limited samples for testing (e.g., 10000 samples)
-  modal run modal_finetune_llada.py::download_and_prepare_dataset --max-samples 10000
-  modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation --max-samples 1000
+# Limited samples for testing
+modal run modal_finetune_llada.py::download_and_prepare_dataset --max-samples 10000
+modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation --max-samples 1000
 
 Step 2: Download pre-trained model
-  modal run modal_finetune_llada.py::download_model
+-----------------------------------
+modal run modal_finetune_llada.py::download_model
 
 Step 3: Train model
-  # LoRA fine-tuning (faster, smaller checkpoints)
-  modal run modal_finetune_llada.py::train_llada --use-lora True
+-------------------
+# LoRA fine-tuning (recommended)
+modal run modal_finetune_llada.py::train_llada --use-lora True
 
-  # Full fine-tuning (best performance)
-  modal run modal_finetune_llada.py::train_llada --use-lora False
+# Full fine-tuning
+modal run modal_finetune_llada.py::train_llada --use-lora False
 
-  # Custom tunable components
-  modal run modal_finetune_llada.py::train_llada --mm-tunable-parts "mm_mlp_adapter"
+# With DeepSpeed (multi-GPU)
+modal run modal_finetune_llada.py::train_llada --use-lora True --deepspeed-config "zero3"
 
-Step 4: Evaluate model
-  modal run modal_finetune_llada.py::evaluate_model
-  
-  modal run modal_finetune_llada.py::evaluate_model --checkpoint-path /data/models/LLaDA-V
+Step 4: Merge LoRA checkpoint
+------------------------------
+# Auto-generated output path (checkpoint-1000 -> checkpoint-1000-merged)
+modal run modal_finetune_llada.py::merge_lora_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000
+    
+modal run modal_finetune_llada.py::merge_lora_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-2500
 
-Step 5: Test inference
-  modal run modal_finetune_llada.py::inference_finetuned --image-path test.png
+# Custom output path
+modal run modal_finetune_llada.py::merge_lora_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000 \
+    --output-path /data/merged_models/my-model
 
-For more options, use --help with any function.
-    """)
+# Push to HuggingFace Hub
+modal run modal_finetune_llada.py::merge_lora_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000 \
+    --huggingface-repo-id "username/model-name" \
+    --private True
+
+Step 5: Evaluate model
+----------------------
+# Evaluate merged model (RECOMMENDED)
+modal run modal_finetune_llada.py::evaluate_model \
+    --model-path /data/checkpoints/llada-latex-ocr/checkpoint-1000-merged
+
+# Evaluate from HuggingFace Hub
+modal run modal_finetune_llada.py::evaluate_model \
+    --model-path "username/model-name"
+
+# Evaluate base model (for comparison)
+modal run modal_finetune_llada.py::evaluate_model \
+    --model-path /data/models/LLaDA-V
+
+Step 6: Test inference
+----------------------
+# Use merged model
+modal run modal_finetune_llada.py::inference_finetuned \
+    --image-path test.png \
+    --model-path /data/checkpoints/llada-latex-ocr/checkpoint-1000-merged
+
+# Use HuggingFace Hub model
+modal run modal_finetune_llada.py::inference_finetuned \
+    --image-path test.png \
+    --model-path "username/model-name"
+"""
