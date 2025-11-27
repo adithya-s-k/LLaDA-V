@@ -463,7 +463,7 @@ def patch_transformers_for_pytorch26():
 def train_llada(
     dataset_path="/data/latex_ocr_dataset_train/dataset.json",
     model_path="/data/models/LLaDA-V",
-    output_dir="/data/checkpoints/llada-latex-ocr",
+    output_dir="/data/checkpoints/llada-latex-ocr-full",
     # Training mode
     use_lora=False,  # True for LoRA, False for full fine-tuning
     # Tunable components (for LoRA: freeze vision tower, train adapter + LLM)
@@ -477,7 +477,7 @@ def train_llada(
     weight_decay=0.0,
     # LoRA-specific parameters
     lora_r=64,
-    lora_alpha=16,
+    lora_alpha=128,
     lora_dropout=0.05,
     # DeepSpeed configuration (optional - only use for multi-GPU training)
     deepspeed_config=None,  # None = no DeepSpeed, "zero2" or "zero3" = enable DeepSpeed
@@ -783,6 +783,7 @@ def merge_lora_checkpoint(
     output_path: str = None,
     huggingface_repo_id: str = None,
     private: bool = True,
+    merge_alpha: float = None,
 ):
     """
     Merge LoRA adapters with base model and optionally push to HuggingFace Hub.
@@ -790,9 +791,10 @@ def merge_lora_checkpoint(
     Args:
         checkpoint_path: Path to LoRA checkpoint directory
         base_model_path: Path to base LLaDA-V model
-        output_path: Output directory for merged model (default: checkpoint-{N}-merged)
+        output_path: Output directory for merged model (default: checkpoint-{N}-merged-alpha{value})
         huggingface_repo_id: HuggingFace repo ID to push to (e.g., "username/model-name")
         private: Whether to make HuggingFace repo private
+        merge_alpha: Alpha scaling factor for merge (default: None = use training alpha)
 
     Returns:
         Dict with status, output_path, and optional hub_url
@@ -803,7 +805,6 @@ def merge_lora_checkpoint(
 
     import warnings
     import torch
-    from peft import PeftModel
     from llava.model.builder import load_pretrained_model
     from huggingface_hub import HfApi
     import shutil
@@ -813,24 +814,6 @@ def merge_lora_checkpoint(
     warnings.filterwarnings(
         "ignore", category=UserWarning, module="torch.nn.modules.module"
     )
-
-    # Auto-generate output path if not specified
-    if output_path is None:
-        checkpoint_name = os.path.basename(checkpoint_path.rstrip("/"))
-        parent_dir = os.path.dirname(checkpoint_path.rstrip("/"))
-        output_path = os.path.join(parent_dir, f"{checkpoint_name}-merged")
-        print(f"Auto-generated output path: {output_path}")
-
-    print("=" * 80)
-    print("MERGE LORA CHECKPOINT")
-    print("=" * 80)
-    print(f"Checkpoint: {checkpoint_path}")
-    print(f"Base model: {base_model_path}")
-    print(f"Output: {output_path}")
-    if huggingface_repo_id:
-        print(f"HuggingFace repo: {huggingface_repo_id} (private={private})")
-    print("=" * 80)
-    print()
 
     # Verify paths
     if not os.path.exists(checkpoint_path):
@@ -842,8 +825,66 @@ def merge_lora_checkpoint(
             f"Not a LoRA checkpoint (missing adapter_config.json): {checkpoint_path}"
         )
 
+    # Read LoRA configuration
+    import json
+
+    with open(os.path.join(checkpoint_path, "adapter_config.json"), "r") as f:
+        adapter_config = json.load(f)
+
+    lora_rank = adapter_config.get("r")
+    training_alpha = adapter_config.get("lora_alpha")
+    use_rslora = adapter_config.get("use_rslora", False)
+
+    if lora_rank is None or training_alpha is None:
+        raise ValueError(
+            "Missing LoRA config in adapter_config.json (need 'r' and 'lora_alpha')"
+        )
+
+    # Determine merge alpha (default to training alpha)
+    if merge_alpha is None:
+        merge_alpha = training_alpha
+        print(f"Using training alpha: {merge_alpha}")
+    else:
+        print(f"Using custom merge alpha: {merge_alpha}")
+
+    # Validate merge_alpha
+    if merge_alpha <= 0:
+        raise ValueError(f"merge_alpha must be positive, got {merge_alpha}")
+
+    # Calculate scaling factor
+    if use_rslora:
+        import math
+
+        merge_scaling = merge_alpha / math.sqrt(lora_rank)
+    else:
+        merge_scaling = merge_alpha / lora_rank
+
+    # Auto-generate output path if not specified (include alpha suffix)
+    if output_path is None:
+        checkpoint_name = os.path.basename(checkpoint_path.rstrip("/"))
+        parent_dir = os.path.dirname(checkpoint_path.rstrip("/"))
+        output_path = os.path.join(
+            parent_dir, f"{checkpoint_name}-merged-alpha{int(merge_alpha)}"
+        )
+
+    print("=" * 80)
+    print("MERGE LORA CHECKPOINT")
+    print("=" * 80)
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Base model: {base_model_path}")
+    print(f"Output: {output_path}")
+    if huggingface_repo_id:
+        print(f"HuggingFace repo: {huggingface_repo_id} (private={private})")
+    print("=" * 80)
+    print()
+    print(
+        f"LoRA config: rank={lora_rank}, training_alpha={training_alpha}, merge_alpha={merge_alpha}"
+    )
+    print(f"Merge scaling factor: {merge_scaling:.6f}")
+    print()
+
     # Load base model
-    print("[1/5] Loading base model...")
+    print("[1/4] Loading base model...")
     tokenizer, model, image_processor, max_length = load_pretrained_model(
         base_model_path,
         None,
@@ -851,17 +892,116 @@ def merge_lora_checkpoint(
         attn_implementation="sdpa",
         device_map="auto",
     )
-    print(f"✓ Base model loaded (max_length={max_length})")
+    print("✓ Base model loaded")
 
-    # Load LoRA adapters
-    print("\n[2/5] Loading LoRA adapters...")
-    model = PeftModel.from_pretrained(model, checkpoint_path)
-    print("✓ LoRA adapters loaded")
+    # Load LoRA adapter weights manually
+    print("\n[2/4] Loading LoRA adapter weights...")
+    from safetensors.torch import load_file
 
-    # Merge and unload
-    print("\n[3/5] Merging LoRA weights into base model...")
-    merged_model = model.merge_and_unload()
-    print("✓ LoRA weights merged")
+    # Find adapter weight files (.safetensors preferred, .bin fallback)
+    adapter_files = [
+        f
+        for f in os.listdir(checkpoint_path)
+        if f.startswith("adapter_model")
+        and (f.endswith(".safetensors") or f.endswith(".bin"))
+    ]
+
+    if not adapter_files:
+        raise FileNotFoundError(f"No adapter weight files found in {checkpoint_path}")
+
+    # Load adapter weights
+    adapter_weights = {}
+    for adapter_file in adapter_files:
+        file_path = os.path.join(checkpoint_path, adapter_file)
+        if file_path.endswith(".safetensors"):
+            adapter_weights.update(load_file(file_path))
+        else:
+            adapter_weights.update(torch.load(file_path, map_location="cpu"))
+
+    print(f"✓ Loaded {len(adapter_weights)} adapter parameters")
+
+    # Load non_lora_trainables.bin if present (mm_projector, etc.)
+    non_lora_path = os.path.join(checkpoint_path, "non_lora_trainables.bin")
+    non_lora_trainables = {}
+    if os.path.exists(non_lora_path):
+        print("Loading non-LoRA trainable weights...")
+        non_lora_trainables = torch.load(non_lora_path, map_location="cpu")
+        # Remove PEFT prefixes
+        non_lora_trainables = {
+            (k[11:] if k.startswith("base_model.") else k): v
+            for k, v in non_lora_trainables.items()
+        }
+        print(f"✓ Loaded {len(non_lora_trainables)} non-LoRA parameters")
+
+    # Manual merge with custom scaling
+    print("\n[3/4] Merging LoRA weights with custom scaling...")
+    base_state_dict = model.state_dict()
+
+    # Group LoRA weights by layer
+    lora_layers = {}
+    for key in adapter_weights.keys():
+        if "lora_A" in key or "lora_B" in key:
+            # Extract base layer name
+            if "lora_A" in key:
+                base_key = key.split(".lora_A")[0]
+                lora_type = "A"
+            else:
+                base_key = key.split(".lora_B")[0]
+                lora_type = "B"
+
+            if base_key not in lora_layers:
+                lora_layers[base_key] = {}
+            lora_layers[base_key][lora_type] = adapter_weights[key]
+
+    print(f"Found {len(lora_layers)} layers with LoRA adapters")
+
+    # Merge each layer
+    merge_count = 0
+    for base_key, lora_weights in lora_layers.items():
+        if "A" not in lora_weights or "B" not in lora_weights:
+            continue
+
+        lora_A = lora_weights["A"]
+        lora_B = lora_weights["B"]
+
+        # Convert PEFT key to state dict key
+        # Remove 'base_model.model.' prefix if present
+        state_dict_key = base_key
+        if state_dict_key.startswith("base_model.model."):
+            state_dict_key = state_dict_key[17:]
+
+        # Add .weight suffix
+        state_dict_key = f"{state_dict_key}.weight"
+
+        if state_dict_key in base_state_dict:
+            base_weight = base_state_dict[state_dict_key]
+
+            # Compute delta: (lora_B @ lora_A) * scaling
+            device = base_weight.device
+            dtype = base_weight.dtype
+
+            # Use float32 for stability
+            delta = (
+                lora_B.to(device, dtype=torch.float32)
+                @ lora_A.to(device, dtype=torch.float32)
+            ) * merge_scaling
+
+            # Add to base weight and convert back
+            merged = base_weight.to(torch.float32) + delta
+            base_state_dict[state_dict_key] = merged.to(dtype)
+            merge_count += 1
+
+    # Load non-LoRA trainables
+    if non_lora_trainables:
+        for key, value in non_lora_trainables.items():
+            if key in base_state_dict:
+                base_state_dict[key] = value
+
+    # Load merged weights
+    model.load_state_dict(base_state_dict, strict=False)
+    merged_model = model
+
+    print(f"✓ Merged {merge_count} LoRA layers with scaling factor {merge_scaling:.6f}")
 
     # Save merged model
     print(f"\n[4/5] Saving merged model to {output_path}...")
@@ -888,8 +1028,26 @@ def merge_lora_checkpoint(
         if os.path.exists(config_src):
             shutil.copy(config_src, output_path)
 
+    # Save merge metadata
+    merge_metadata = {
+        "checkpoint_path": checkpoint_path,
+        "base_model_path": base_model_path,
+        "lora_config": {
+            "r": lora_rank,
+            "training_alpha": training_alpha,
+            "merge_alpha": merge_alpha,
+            "use_rslora": use_rslora,
+            "merge_scaling": merge_scaling,
+        },
+        "merge_method": "manual",
+    }
+
+    with open(os.path.join(output_path, "merge_metadata.json"), "w") as f:
+        json.dump(merge_metadata, f, indent=2)
+
     volume.commit()
     print("✓ Merged model saved")
+    print(f"✓ Merge metadata saved to {output_path}/merge_metadata.json")
 
     # Push to HuggingFace Hub if requested
     hub_url = None
@@ -920,6 +1078,14 @@ This model is a fine-tuned version of [GSAI-ML/LLaDA-V](https://huggingface.co/G
 - **Fine-tuning Method**: LoRA
 - **Dataset**: LaTeX OCR equations
 - **Checkpoint**: {os.path.basename(checkpoint_path)}
+
+## LoRA Configuration
+
+- **Rank**: {lora_rank}
+- **Training Alpha**: {training_alpha}
+- **Merge Alpha**: {merge_alpha}
+- **Scaling Factor**: {merge_scaling:.6f}
+- **RS-LoRA**: {use_rslora}
 
 ## Usage
 
@@ -1010,6 +1176,266 @@ print(latex)
         "output_path": output_path,
         "hub_url": hub_url,
     }
+
+
+# ==============================================================================
+# PROCESS FULL CHECKPOINT
+# ==============================================================================
+
+
+@app.function(
+    image=image,
+    volumes={"/data": volume},
+    timeout=1 * HOURS,
+    secrets=[huggingface_secret],
+)
+def process_full_checkpoint(
+    checkpoint_path: str = "/data/checkpoints/llada-latex-ocr-full/checkpoint-7500",
+    output_path: str = None,
+    huggingface_repo_id: str = None,
+    private: bool = True,
+):
+    """
+    Process full fine-tuned checkpoint for deployment.
+
+    Creates a clean version with only inference-essential files by removing
+    training artifacts (optimizer.pt, scheduler.pt, etc.).
+
+    Args:
+        checkpoint_path: Path to full fine-tuned checkpoint directory
+        output_path: Output directory (default: checkpoint-{N}-processed)
+        huggingface_repo_id: HuggingFace repo ID to push to
+        private: Whether to make HuggingFace repo private
+
+    Returns:
+        Dict with status, output_path, and optional hub_url
+    """
+    import glob
+    import json
+    import shutil
+    from datetime import datetime
+    from huggingface_hub import HfApi
+
+    # Verify checkpoint exists
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    # Verify it's a full checkpoint (has model files, not adapter_config.json)
+    if os.path.exists(os.path.join(checkpoint_path, "adapter_config.json")):
+        raise ValueError(
+            "This is a LoRA checkpoint, use merge_lora_checkpoint() instead"
+        )
+
+    # Verify model files exist
+    model_index = os.path.join(checkpoint_path, "model.safetensors.index.json")
+    if not os.path.exists(model_index):
+        raise ValueError(
+            f"Not a valid checkpoint (missing model.safetensors.index.json): {checkpoint_path}"
+        )
+
+    # Auto-generate output path if not specified
+    if output_path is None:
+        checkpoint_name = os.path.basename(checkpoint_path.rstrip("/"))
+        parent_dir = os.path.dirname(checkpoint_path.rstrip("/"))
+        output_path = os.path.join(parent_dir, f"{checkpoint_name}-processed")
+
+    print("=" * 80)
+    print("PROCESS FULL FINE-TUNED CHECKPOINT")
+    print("=" * 80)
+    print(f"Input: {checkpoint_path}")
+    print(f"Output: {output_path}")
+    if huggingface_repo_id:
+        print(f"HuggingFace repo: {huggingface_repo_id} (private={private})")
+    print("=" * 80)
+    print()
+
+    # Files to keep (inference essential)
+    ESSENTIAL_PATTERNS = [
+        "model-*.safetensors",  # Model weights (sharded)
+        "model.safetensors",  # Model weights (single file)
+        "model.safetensors.index.json",  # Sharded model index
+        "config.json",  # Model config
+        "configuration_llada.py",  # Custom LLaDA config
+        "tokenizer.json",  # Tokenizer vocabulary
+        "tokenizer_config.json",  # Tokenizer config
+        "special_tokens_map.json",  # Special tokens
+        "generation_config.json",  # Generation params
+    ]
+
+    # Files to explicitly skip (training only)
+    TRAINING_FILES = [
+        "optimizer.pt",
+        "scheduler.pt",
+        "rng_state.pth",
+        "trainer_state.json",
+        "training_args.bin",
+    ]
+
+    print("[1/3] Copying essential files...")
+    os.makedirs(output_path, exist_ok=True)
+
+    copied_files = []
+    total_size = 0
+
+    # Copy files matching essential patterns
+    for pattern in ESSENTIAL_PATTERNS:
+        pattern_path = os.path.join(checkpoint_path, pattern)
+        matched_files = glob.glob(pattern_path)
+
+        for src_file in matched_files:
+            filename = os.path.basename(src_file)
+            dst_file = os.path.join(output_path, filename)
+
+            shutil.copy2(src_file, dst_file)
+            file_size = os.path.getsize(src_file)
+            total_size += file_size
+            copied_files.append(filename)
+
+    print(
+        f"✓ Copied {len(copied_files)} essential files ({total_size / 1024**3:.1f} GB)"
+    )
+
+    # Fix config.json to use HuggingFace vision tower instead of local path
+    print("\n[2/4] Fixing vision tower reference in config...")
+    config_path = os.path.join(output_path, "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config = json.load(f)
+
+        # Update vision tower to use HuggingFace model ID
+        if config.get("mm_vision_tower") == "/data/models/LLaDA-V":
+            config["mm_vision_tower"] = "google/siglip2-so400m-patch14-384"
+            with open(config_path, "w") as f:
+                json.dump(config, f, indent=2)
+            print("✓ Updated mm_vision_tower to: google/siglip2-so400m-patch14-384")
+        else:
+            print(f"✓ Vision tower already correct: {config.get('mm_vision_tower')}")
+    else:
+        print("⚠ Warning: config.json not found")
+
+    # Create processing metadata
+    print("\n[3/4] Creating processing metadata...")
+
+    # Calculate space saved
+    checkpoint_size = sum(
+        os.path.getsize(os.path.join(checkpoint_path, f))
+        for f in os.listdir(checkpoint_path)
+        if os.path.isfile(os.path.join(checkpoint_path, f))
+    )
+    space_saved = checkpoint_size - total_size
+
+    processing_metadata = {
+        "source_checkpoint": checkpoint_path,
+        "processed_date": datetime.now().isoformat(),
+        "files_copied": len(copied_files),
+        "total_size_gb": total_size / 1024**3,
+        "space_saved_gb": space_saved / 1024**3,
+        "files_removed": TRAINING_FILES,
+        "essential_patterns": ESSENTIAL_PATTERNS,
+    }
+
+    with open(os.path.join(output_path, "processing_metadata.json"), "w") as f:
+        json.dump(processing_metadata, f, indent=2)
+
+    print(f"✓ Saved {space_saved / 1024**3:.1f} GB by removing training files")
+
+    # Finalize
+    print("\n[4/4] Finalizing...")
+    volume.commit()
+
+    hub_url = None
+    if huggingface_repo_id:
+        print(f"\nPushing to HuggingFace Hub: {huggingface_repo_id}...")
+
+        os.environ["HF_TOKEN"] = os.environ.get("HUGGINGFACE_TOKEN", "")
+        api = HfApi()
+
+        # Create repo if it doesn't exist
+        try:
+            api.create_repo(
+                repo_id=huggingface_repo_id,
+                private=private,
+                exist_ok=True,
+            )
+        except Exception as e:
+            print(f"Note: {e}")
+
+        # Create model card
+        model_card = f"""---
+tags:
+- vision
+- image-text-to-text
+- llava
+- latex
+- ocr
+library_name: transformers
+pipeline_tag: image-text-to-text
+---
+
+# LLaDA-V Fine-tuned for LaTeX OCR
+
+This is a processed deployment version of a full fine-tuned LLaDA-V model.
+
+## Training Details
+
+- **Base Model**: GSAI-ML/LLaDA-V
+- **Fine-tuning Method**: Full Fine-tuning
+- **Dataset**: LaTeX OCR equations
+- **Source Checkpoint**: {os.path.basename(checkpoint_path)}
+
+## Processing
+
+This checkpoint has been processed for deployment:
+- Training files removed (optimizer, scheduler, RNG state)
+- Space saved: {space_saved / 1024**3:.1f} GB
+- Only inference-essential files retained
+
+## Usage
+
+```python
+from llava.model.builder import load_pretrained_model
+
+tokenizer, model, image_processor, _ = load_pretrained_model(
+    "{huggingface_repo_id}",
+    None,
+    "llava_llada",
+    device_map="auto",
+)
+```
+"""
+
+        with open(os.path.join(output_path, "README.md"), "w") as f:
+            f.write(model_card)
+
+        # Upload to Hub
+        api.upload_folder(
+            folder_path=output_path,
+            repo_id=huggingface_repo_id,
+            repo_type="model",
+        )
+
+        hub_url = f"https://huggingface.co/{huggingface_repo_id}"
+        print(f"✓ Pushed to {hub_url}")
+
+    print("\n" + "=" * 80)
+    print("✓ Processing completed successfully!")
+    print(f"Clean checkpoint: {output_path}")
+    if hub_url:
+        print(f"HuggingFace Hub: {hub_url}")
+    print("=" * 80)
+
+    result = {
+        "status": "success",
+        "output_path": output_path,
+        "files_copied": len(copied_files),
+        "size_gb": total_size / 1024**3,
+        "space_saved_gb": space_saved / 1024**3,
+    }
+
+    if hub_url:
+        result["hub_url"] = hub_url
+
+    return result
 
 
 # ==============================================================================
@@ -1561,31 +1987,57 @@ modal run modal_finetune_llada.py::train_llada --use-lora False
 # With DeepSpeed (multi-GPU)
 modal run modal_finetune_llada.py::train_llada --use-lora True --deepspeed-config "zero3"
 
-Step 4: Merge LoRA checkpoint
-------------------------------
-# Auto-generated output path (checkpoint-1000 -> checkpoint-1000-merged)
+Step 4a: Process LoRA checkpoint (if using LoRA)
+-------------------------------------------------
+# Default: uses training alpha from checkpoint (e.g., checkpoint-1000-merged-alpha128)
 modal run modal_finetune_llada.py::merge_lora_checkpoint \
     --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000
-    
-modal run modal_finetune_llada.py::merge_lora_checkpoint \
-    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-2500
 
-# Custom output path
+# Custom alpha: 2x rank (for rank=64, alpha=128)
+modal run modal_finetune_llada.py::merge_lora_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000 \
+    --merge-alpha 128
+
+# Custom alpha: 4x rank (for rank=64, alpha=256)
+modal run modal_finetune_llada.py::merge_lora_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000 \
+    --merge-alpha 256
+
+# Custom output path (overrides automatic alpha suffix)
 modal run modal_finetune_llada.py::merge_lora_checkpoint \
     --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000 \
     --output-path /data/merged_models/my-model
 
-# Push to HuggingFace Hub
+# Push to HuggingFace Hub with custom alpha
 modal run modal_finetune_llada.py::merge_lora_checkpoint \
     --checkpoint-path /data/checkpoints/llada-latex-ocr/checkpoint-1000 \
+    --merge-alpha 128 \
     --huggingface-repo-id "username/model-name" \
+    --private True
+
+Step 4b: Process full fine-tuned checkpoint (if using full fine-tuning)
+------------------------------------------------------------------------
+# Default: checkpoint-7500-processed (removes optimizer.pt, saves ~15GB)
+modal run modal_finetune_llada.py::process_full_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr-full/checkpoint-7500
+
+# Custom output path
+modal run modal_finetune_llada.py::process_full_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr-full/checkpoint-7500 \
+    --output-path /data/models/llada-latex-final
+
+# Push to HuggingFace Hub
+modal run modal_finetune_llada.py::process_full_checkpoint \
+    --checkpoint-path /data/checkpoints/llada-latex-ocr-full/checkpoint-7500 \
+    --huggingface-repo-id "username/llada-latex-ocr" \
     --private True
 
 Step 5: Evaluate model
 ----------------------
 # Evaluate merged model (RECOMMENDED)
+# Note: Path includes alpha value (e.g., checkpoint-1000-merged-alpha128)
 modal run modal_finetune_llada.py::evaluate_model \
-    --model-path /data/checkpoints/llada-latex-ocr/checkpoint-1000-merged
+    --model-path /data/checkpoints/llada-latex-ocr/checkpoint-1000-merged-alpha128
 
 # Evaluate from HuggingFace Hub
 modal run modal_finetune_llada.py::evaluate_model \
@@ -1597,10 +2049,10 @@ modal run modal_finetune_llada.py::evaluate_model \
 
 Step 6: Test inference
 ----------------------
-# Use merged model
+# Use merged model (includes alpha in path)
 modal run modal_finetune_llada.py::inference_finetuned \
     --image-path test.png \
-    --model-path /data/checkpoints/llada-latex-ocr/checkpoint-1000-merged
+    --model-path /data/checkpoints/llada-latex-ocr/checkpoint-1000-merged-alpha128
 
 # Use HuggingFace Hub model
 modal run modal_finetune_llada.py::inference_finetuned \
