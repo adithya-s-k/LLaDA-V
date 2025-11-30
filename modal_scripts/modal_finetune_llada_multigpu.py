@@ -330,10 +330,11 @@ def create_deepspeed_config(stage: int = 2) -> str:
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada_fsdp(
-    dataset_path: str = "/data/latex_ocr_dataset_train/dataset.json",
+    dataset_path: str = "/data/latex_ocr_dataset_train",
     model_path: str = "/data/models/LLaDA-V",
     output_dir: str = "/data/checkpoints/llada-latex-ocr-fsdp",
     use_lora: bool = True,
+    use_hf_dataset: bool = True,
     mm_tunable_parts: str = "mm_mlp_adapter,mm_language_model",
     num_train_epochs: int = 3,
     learning_rate: float = 2e-5,
@@ -440,10 +441,18 @@ def train_llada_fsdp(
         model_path,
         "--version",
         "llava_llada",
-        "--data_path",
-        dataset_path,
-        "--image_folder",
-        os.path.dirname(dataset_path),
+    ]
+
+    # Add dataset-specific arguments based on format
+    if use_hf_dataset:
+        # HuggingFace Arrow format
+        hf_dataset_path = dataset_path if not dataset_path.endswith(".json") else os.path.dirname(dataset_path)
+        command.extend(["--data_path", hf_dataset_path, "--use_hf_dataset", "True"])
+    else:
+        # Legacy JSON format
+        command.extend(["--data_path", dataset_path, "--image_folder", os.path.dirname(dataset_path)])
+
+    command.extend([
         "--vision_tower",
         model_path,
         # Vision-language configuration
@@ -519,7 +528,7 @@ def train_llada_fsdp(
         "no",
         "--use_conversation_mask",
         "False",
-    ]
+    ])
 
     # Add LoRA flags if enabled
     if use_lora:
@@ -581,10 +590,11 @@ def train_llada_fsdp(
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada_ddp(
-    dataset_path: str = "/data/latex_ocr_dataset_train/dataset.json",
+    dataset_path: str = "/data/latex_ocr_dataset_train",
     model_path: str = "/data/models/LLaDA-V",
     output_dir: str = "/data/checkpoints/llada-latex-ocr-ddp",
     use_lora: bool = True,
+    use_hf_dataset: bool = True,
     mm_tunable_parts: str = "mm_mlp_adapter,mm_language_model",
     num_train_epochs: int = 2,
     learning_rate: float = 2e-5,
@@ -699,10 +709,18 @@ def train_llada_ddp(
         model_path,
         "--version",
         "llava_llada",
-        "--data_path",
-        dataset_path,
-        "--image_folder",
-        os.path.dirname(dataset_path),
+    ]
+
+    # Add dataset-specific arguments based on format
+    if use_hf_dataset:
+        # HuggingFace Arrow format
+        hf_dataset_path = dataset_path if not dataset_path.endswith(".json") else os.path.dirname(dataset_path)
+        command.extend(["--data_path", hf_dataset_path, "--use_hf_dataset", "True"])
+    else:
+        # Legacy JSON format
+        command.extend(["--data_path", dataset_path, "--image_folder", os.path.dirname(dataset_path)])
+
+    command.extend([
         "--vision_tower",
         model_path,
         # Vision-language configuration
@@ -778,7 +796,7 @@ def train_llada_ddp(
         "no",
         "--use_conversation_mask",
         "False",
-    ]
+    ])
 
     # Add LoRA flags if enabled
     if use_lora:
@@ -834,10 +852,11 @@ def train_llada_ddp(
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada_ddp_deepspeed(
-    dataset_path: str = "/data/latex_ocr_dataset_train/dataset.json",
+    dataset_path: str = "/data/latex_ocr_dataset_train",
     model_path: str = "/data/models/LLaDA-V",
     output_dir: str = "/data/checkpoints/llada-latex-ocr-ddp",
     use_lora: bool = True,
+    use_hf_dataset: bool = True,
     mm_tunable_parts: str = "mm_mlp_adapter,mm_language_model",
     num_train_epochs: int = 3,
     learning_rate: float = 2e-5,
@@ -961,10 +980,18 @@ def train_llada_ddp_deepspeed(
         model_path,
         "--version",
         "llava_llada",
-        "--data_path",
-        dataset_path,
-        "--image_folder",
-        os.path.dirname(dataset_path),
+    ]
+
+    # Add dataset-specific arguments based on format
+    if use_hf_dataset:
+        # HuggingFace Arrow format
+        hf_dataset_path = dataset_path if not dataset_path.endswith(".json") else os.path.dirname(dataset_path)
+        command.extend(["--data_path", hf_dataset_path, "--use_hf_dataset", "True"])
+    else:
+        # Legacy JSON format
+        command.extend(["--data_path", dataset_path, "--image_folder", os.path.dirname(dataset_path)])
+
+    command.extend([
         "--vision_tower",
         model_path,
         # Vision-language configuration
@@ -1038,7 +1065,7 @@ def train_llada_ddp_deepspeed(
         "no",
         "--use_conversation_mask",
         "False",
-    ]
+    ])
 
     # Add LoRA flags if enabled
     if use_lora:
@@ -1086,3 +1113,90 @@ def train_llada_ddp_deepspeed(
         "gpu_count": gpu_count,
         "gpu_type": GPU_TYPE,
     }
+
+
+# ==============================================================================
+# USAGE EXAMPLES
+# ==============================================================================
+
+"""
+SINGLE GPU TRAINING (modal_finetune_llada.py):
+------------------------------------------------
+
+# Prepare dataset (HuggingFace Arrow format - RECOMMENDED):
+modal run modal_finetune_llada.py::download_and_prepare_dataset \\
+    --save-format arrow \\
+    --max-samples 100
+
+# Train with Arrow format:
+modal run modal_finetune_llada.py::train_llada \\
+    --dataset-path /data/datasets/latex_ocr_dataset_train \\
+    --use-hf-dataset True \\
+    --use-lora True
+
+# Prepare dataset (Legacy JSON format):
+modal run modal_finetune_llada.py::download_and_prepare_dataset \\
+    --save-format json \\
+    --max-samples 100
+
+# Train with JSON format:
+modal run modal_finetune_llada.py::train_llada \\
+    --dataset-path /data/datasets/latex_ocr_dataset_train/dataset.json \\
+    --use-hf-dataset False \\
+    --use-lora True
+
+
+MULTI-GPU TRAINING (modal_finetune_llada_multigpu.py):
+-------------------------------------------------------
+
+# Configure GPUs at top of file:
+GPU_COUNT = 4  # Options: 2, 4, 8
+GPU_TYPE = "A100-80GB"  # Options: "A100-80GB", "H100", "L40s"
+
+# FSDP Training (Arrow format - RECOMMENDED):
+modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \\
+    --dataset-path /data/latex_ocr_dataset_train \\
+    --use-hf-dataset True \\
+    --use-lora True
+
+# FSDP Training (JSON format):
+modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \\
+    --dataset-path /data/latex_ocr_dataset_train/dataset.json \\
+    --use-hf-dataset False \\
+    --use-lora True
+
+# Vanilla DDP Training (Arrow format - RECOMMENDED):
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp \\
+    --dataset-path /data/latex_ocr_dataset_train \\
+    --use-hf-dataset True \\
+    --use-lora True
+
+# Vanilla DDP Training (JSON format):
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp \\
+    --dataset-path /data/latex_ocr_dataset_train/dataset.json \\
+    --use-hf-dataset False \\
+    --use-lora True
+
+# DDP + DeepSpeed Training (Arrow format - RECOMMENDED):
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \\
+    --dataset-path /data/latex_ocr_dataset_train \\
+    --use-hf-dataset True \\
+    --use-lora True \\
+    --deepspeed-stage 2
+
+# DDP + DeepSpeed Training (JSON format):
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \\
+    --dataset-path /data/latex_ocr_dataset_train/dataset.json \\
+    --use-hf-dataset False \\
+    --use-lora True \\
+    --deepspeed-stage 2
+
+
+BENEFITS OF ARROW FORMAT:
+--------------------------
+- 2-5x faster loading (no disk I/O during training)
+- Memory efficient (memory-mapped Arrow files)
+- No corrupted image issues (filtered during preparation)
+- Smaller storage footprint (compressed images)
+- Backward compatible (JSON format still supported)
+"""
