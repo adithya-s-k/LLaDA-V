@@ -134,6 +134,7 @@ class DataArguments:
     is_multimodal: bool = False
     early_mix_text: bool = False
     use_webdataset: bool = False
+    use_hf_dataset: bool = False
     total_samples: Optional[int] = field(default=None)
 
     image_folder: Optional[str] = field(default=None)
@@ -1215,6 +1216,165 @@ class WebDatasetSupervisedDataset(torch.utils.data.IterableDataset):
             print(f"Failed to process sample. Exception: {exn}")
             return None  # Return None to skip this sample
 
+
+class HuggingFaceDataset(Dataset):
+    """Dataset class for HuggingFace Arrow format with embedded images."""
+
+    def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
+        super(HuggingFaceDataset, self).__init__()
+        from datasets import load_from_disk
+
+        self.tokenizer = tokenizer
+        self.data_args = data_args
+
+        rank0_print(f"Loading HuggingFace dataset from: {data_path}")
+        self.dataset = load_from_disk(data_path)
+        rank0_print(f"Loaded {len(self.dataset)} samples from HuggingFace dataset")
+
+    def __len__(self):
+        return len(self.dataset)
+
+    @property
+    def lengths(self):
+        """Calculate conversation lengths for grouping."""
+        length_list = []
+        for sample in self.dataset:
+            img_tokens = 128 if "image" in sample else 0
+            conv_len = sum(len(conv["value"].split()) for conv in sample["conversations"])
+            length_list.append(conv_len + img_tokens)
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        """Calculate modality-aware lengths."""
+        length_list = []
+        for sample in self.dataset:
+            cur_len = sum(len(conv["value"].split()) for conv in sample["conversations"])
+            if "image" in sample or self.data_args.early_mix_text:
+                length_list.append(cur_len)
+            else:
+                length_list.append(-cur_len)
+        return length_list
+
+    def process_image(self, image, overwrite_image_aspect_ratio=None):
+        """Process PIL Image (same logic as LazySupervisedDataset but with PIL Image input)."""
+        processor = self.data_args.image_processor
+        image_aspect_ratio = overwrite_image_aspect_ratio or self.data_args.image_aspect_ratio
+
+        # Image is already PIL Image from HuggingFace dataset
+        image_size = image.size
+
+        # Apply aspect ratio processing
+        if image_aspect_ratio == "highres":
+            image = process_highres_image(image, processor, self.data_args.image_grid_pinpoints)
+        elif image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
+            image = process_anyres_image(image, processor, self.data_args.image_grid_pinpoints)
+        elif image_aspect_ratio == "crop_split":
+            image = process_highres_image_crop_split(image, self.data_args)
+        elif image_aspect_ratio == "pad":
+            def expand2square(pil_img, background_color):
+                width, height = pil_img.size
+                if width == height:
+                    return pil_img
+                elif width > height:
+                    result = Image.new(pil_img.mode, (width, width), background_color)
+                    result.paste(pil_img, (0, (width - height) // 2))
+                    return result
+                else:
+                    result = Image.new(pil_img.mode, (height, height), background_color)
+                    result.paste(pil_img, ((height - width) // 2, 0))
+                    return result
+
+            image = expand2square(image, tuple(int(x * 255) for x in processor.image_mean))
+            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+        else:
+            image = processor.preprocess(image, return_tensors="pt")["pixel_values"][0]
+
+        return image, image_size, "image"
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        """Get item with retry logic."""
+        num_base_retries = 3
+
+        # Try current sample
+        for attempt in range(num_base_retries):
+            try:
+                return self._get_item(i)
+            except Exception as e:
+                print(f"[Try #{attempt}] Failed to fetch sample {i}: {e}")
+                time.sleep(1)
+
+        # Try next sample
+        for attempt in range(num_base_retries):
+            try:
+                return self._get_item(min(i + 1, len(self.dataset) - 1))
+            except Exception as e:
+                print(f"[Try other #{attempt}] Failed: {e}")
+
+        # Final attempt
+        return self._get_item(i)
+
+    def _get_item(self, i) -> Dict[str, torch.Tensor]:
+        """Internal method to get and process item."""
+        sample = self.dataset[i]
+
+        # Process image if present
+        if "image" in sample and sample["image"] is not None:
+            image_pil = sample["image"]  # Already PIL Image from HF
+
+            if isinstance(image_pil, list):
+                if len(image_pil) > 1:
+                    image = [self.process_image(img, "pad") for img in image_pil]
+                    image = [[im[0], im[1], "image"] for im in image]
+                else:
+                    image = [self.process_image(image_pil[0])]
+            else:
+                image = [self.process_image(image_pil)]
+
+            sources = preprocess_multimodal(
+                copy.deepcopy([sample["conversations"]]),
+                self.data_args
+            )
+            has_image = True
+        else:
+            has_image = False
+            image = None
+            sources = copy.deepcopy([sample["conversations"]])
+
+        # Tokenize
+        data_dict = preprocess(sources, self.tokenizer, has_image=has_image)
+
+        if isinstance(i, int):
+            data_dict = dict(
+                input_ids=data_dict["input_ids"][0],
+                labels=data_dict["labels"][0]
+            )
+
+        # Add image data
+        if has_image:
+            data_dict["image"] = image
+        elif self.data_args.is_multimodal:
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict["image"] = [
+                (torch.zeros(1, 3, crop_size["height"], crop_size["width"]),
+                 (crop_size["width"], crop_size["height"]),
+                 "text"),
+            ]
+
+        # Add metadata
+        data_dict["id"] = sample.get("id", i)
+
+        # LLaDA flags
+        if conversation_lib.default_conversation.version == "llada_plain":
+            data_dict["is_plain"] = True
+            data_dict["is_llada"] = True
+        elif conversation_lib.default_conversation.version == "llava_llada":
+            data_dict["is_plain"] = False
+            data_dict["is_llada"] = True
+
+        return data_dict
+
+
 class LazySupervisedDataset(Dataset):
     def __init__(self, data_path: str, tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
@@ -1592,22 +1752,29 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args, training_args) -> Dict:
     """Create dataset and collator for supervised fine-tuning."""
-    # Check if using WebDataset format
-    if getattr(data_args, "use_webdataset", False) or data_args.data_path.endswith(".tar"):
+    # Detect dataset format and create appropriate dataset
+    if getattr(data_args, "use_hf_dataset", False):
+        rank0_print("Loading data using HuggingFace dataset format (Arrow)")
+        train_dataset = HuggingFaceDataset(
+            tokenizer=tokenizer,
+            data_path=data_args.data_path,
+            data_args=data_args
+        )
+    elif getattr(data_args, "use_webdataset", False) or data_args.data_path.endswith(".tar"):
         rank0_print("Loading data using WebDataset format")
         train_dataset = WebDatasetSupervisedDataset(
-            tokenizer=tokenizer, 
+            tokenizer=tokenizer,
             data_path=data_args.data_path,
             data_args=data_args
         )
     else:
         rank0_print("Loading data using traditional JSON format")
         train_dataset = LazySupervisedDataset(
-            tokenizer=tokenizer, 
+            tokenizer=tokenizer,
             data_path=data_args.data_path,
             data_args=data_args
         )
-    
+
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, training_args=training_args)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 

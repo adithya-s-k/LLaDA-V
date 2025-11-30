@@ -148,6 +148,17 @@ image = (
 huggingface_secret = Secret.from_name("adithya-hf-wandb")
 
 # ==============================================================================
+# OUTPUT DIRECTORY CONFIGURATION - EDIT THIS TO ORGANIZE EXPERIMENTS
+# ==============================================================================
+
+OUTPUT_BASE_DIR = "/data/llada_single_gpu"  # Base directory for all outputs
+
+# Derived paths
+MODELS_DIR = f"{OUTPUT_BASE_DIR}/models"
+DATASETS_DIR = f"{OUTPUT_BASE_DIR}/datasets"
+CHECKPOINTS_DIR = f"{OUTPUT_BASE_DIR}/checkpoints"
+
+# ==============================================================================
 # DATASET PREPARATION
 # ==============================================================================
 
@@ -162,6 +173,7 @@ def download_and_prepare_dataset(
     dataset_name: str = "lukbl/LaTeX-OCR-dataset",
     split: str = "train",
     max_samples: int = None,
+    save_format: str = "arrow",
 ):
     """
     Download and prepare LaTeX OCR dataset in LLaDA-V conversation format.
@@ -170,6 +182,7 @@ def download_and_prepare_dataset(
         dataset_name: HuggingFace dataset name
         split: Dataset split ("train" or "validation")
         max_samples: Optional limit for testing (None for all samples)
+        save_format: Save format ("arrow" for HuggingFace Arrow format, "json" for legacy JSON+images)
 
     Returns:
         Dict with status, dataset path, and sample count
@@ -178,7 +191,7 @@ def download_and_prepare_dataset(
     from PIL import Image
     from io import BytesIO
 
-    target_dataset_path = f"/data/latex_ocr_dataset_{split}"
+    target_dataset_path = f"{DATASETS_DIR}/latex_ocr_dataset_{split}"
 
     print(f"Loading {dataset_name} ({split})")
     dataset = load_dataset(dataset_name, split=split)
@@ -264,9 +277,25 @@ def download_and_prepare_dataset(
             ],
         }
 
-    # Step 1: Filter valid samples
+    # Step 1: Filter valid samples manually to avoid automatic image decoding
     print("Step 1/2: Filtering valid samples...")
-    valid_dataset = dataset.filter(is_valid_sample, desc="Filtering")
+    from tqdm import tqdm
+
+    valid_indices = []
+    print("  Checking samples for validity...")
+
+    # Manually iterate to avoid automatic PIL decoding
+    for idx in tqdm(range(len(dataset)), desc="Filtering"):
+        try:
+            sample = dataset[idx]
+            if is_valid_sample(sample):
+                valid_indices.append(idx)
+        except Exception:
+            # Skip corrupted samples
+            continue
+
+    # Select only valid samples
+    valid_dataset = dataset.select(valid_indices)
     print(f"  Kept {len(valid_dataset)}/{len(dataset)} valid samples")
 
     # Step 2: Transform to LLaDA-V format
@@ -281,51 +310,79 @@ def download_and_prepare_dataset(
     if len(filtered_dataset) == 0:
         raise ValueError("No valid samples after filtering")
 
-    # Save dataset in JSON format for LLaDA-V training
-    import json
     import os
 
-    os.makedirs(target_dataset_path, exist_ok=True)
-    images_dir = os.path.join(target_dataset_path, "images")
-    os.makedirs(images_dir, exist_ok=True)
-
-    # Convert dataset to JSON with saved images
-    json_data = []
-    for sample in filtered_dataset:
-        # Save image to file
-        image = sample["image"]
-        image_filename = f"{sample['id']}.jpg"
-        image_path = os.path.join(images_dir, image_filename)
-        image.save(image_path, "JPEG")
-
-        # Create JSON entry with relative image path
-        json_entry = {
-            "id": sample["id"],
-            "image": os.path.join("images", image_filename),
-            "conversations": sample["conversations"],
-        }
-        json_data.append(json_entry)
-
-    # Save JSON file
-    json_path = os.path.join(target_dataset_path, "dataset.json")
-    with open(json_path, "w") as f:
-        json.dump(json_data, f, indent=2)
-
-    volume.commit()
-
     success_rate = len(filtered_dataset) / len(dataset) * 100
-    print(
-        f"✓ Saved {len(filtered_dataset)}/{len(dataset)} samples ({success_rate:.1f}%)"
-    )
-    print(f"  JSON file: {json_path}")
-    print(f"  Images directory: {images_dir}")
 
-    return {
-        "status": "completed",
-        "dataset_path": json_path,  # Return JSON file path, not directory
-        "samples": len(filtered_dataset),
-        "success_rate": f"{success_rate:.1f}%",
-    }
+    # Save dataset based on format
+    if save_format == "arrow":
+        # Save as HuggingFace Dataset (Arrow format with embedded images)
+        os.makedirs(target_dataset_path, exist_ok=True)
+
+        # Save to disk in Arrow format
+        # HuggingFace datasets automatically infers the schema and encodes PIL Images
+        print(f"Saving to {target_dataset_path} in Arrow format...")
+        filtered_dataset.save_to_disk(target_dataset_path)
+
+        volume.commit()
+
+        print(
+            f"✓ Saved {len(filtered_dataset)}/{len(dataset)} samples ({success_rate:.1f}%) in Arrow format"
+        )
+        print(f"  Dataset directory: {target_dataset_path}")
+
+        return {
+            "status": "completed",
+            "dataset_path": target_dataset_path,
+            "samples": len(filtered_dataset),
+            "success_rate": f"{success_rate:.1f}%",
+            "format": "arrow",
+        }
+    else:
+        # Save dataset in JSON format for LLaDA-V training (legacy)
+        import json
+
+        os.makedirs(target_dataset_path, exist_ok=True)
+        images_dir = os.path.join(target_dataset_path, "images")
+        os.makedirs(images_dir, exist_ok=True)
+
+        # Convert dataset to JSON with saved images
+        json_data = []
+        for sample in tqdm(filtered_dataset, desc="Saving images"):
+            # Save image to file
+            image = sample["image"]
+            image_filename = f"{sample['id']}.jpg"
+            image_path = os.path.join(images_dir, image_filename)
+            image.save(image_path, "JPEG")
+
+            # Create JSON entry with relative image path
+            json_entry = {
+                "id": sample["id"],
+                "image": os.path.join("images", image_filename),
+                "conversations": sample["conversations"],
+            }
+            json_data.append(json_entry)
+
+        # Save JSON file
+        json_path = os.path.join(target_dataset_path, "dataset.json")
+        with open(json_path, "w") as f:
+            json.dump(json_data, f, indent=2)
+
+        volume.commit()
+
+        print(
+            f"✓ Saved {len(filtered_dataset)}/{len(dataset)} samples ({success_rate:.1f}%) in JSON format"
+        )
+        print(f"  JSON file: {json_path}")
+        print(f"  Images directory: {images_dir}")
+
+        return {
+            "status": "completed",
+            "dataset_path": json_path,  # Return JSON file path, not directory
+            "samples": len(filtered_dataset),
+            "success_rate": f"{success_rate:.1f}%",
+            "format": "json",
+        }
 
 
 # ==============================================================================
@@ -359,9 +416,9 @@ def download_model(force_redownload: bool = False):
     from huggingface_hub import snapshot_download
     import shutil
 
-    os.makedirs("/data/models", exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
 
-    model_path = "/data/models/LLaDA-V"
+    model_path = f"{MODELS_DIR}/LLaDA-V"
     config_path = os.path.join(model_path, "config.json")
 
     # Check if download is broken (lock files but no actual config)
@@ -461,17 +518,17 @@ def patch_transformers_for_pytorch26():
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada(
-    dataset_path="/data/latex_ocr_dataset_train/dataset.json",
-    model_path="/data/models/LLaDA-V",
-    output_dir="/data/checkpoints/llada-latex-ocr-full",
+    dataset_path=f"{DATASETS_DIR}/latex_ocr_dataset_train",
+    model_path=f"{MODELS_DIR}/LLaDA-V",
+    output_dir=f"{CHECKPOINTS_DIR}/llada-latex-ocr-full",
     # Training mode
     use_lora=False,  # True for LoRA, False for full fine-tuning
     # Tunable components (for LoRA: freeze vision tower, train adapter + LLM)
     mm_tunable_parts="mm_mlp_adapter,mm_language_model",
     # Training hyperparameters
-    num_train_epochs=3,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,
+    num_train_epochs=2,
+    per_device_train_batch_size=8,
+    gradient_accumulation_steps=8,
     learning_rate=2e-5,
     warmup_ratio=0.03,
     weight_decay=0.0,
@@ -481,6 +538,8 @@ def train_llada(
     lora_dropout=0.05,
     # DeepSpeed configuration (optional - only use for multi-GPU training)
     deepspeed_config=None,  # None = no DeepSpeed, "zero2" or "zero3" = enable DeepSpeed
+    # Dataset format
+    use_hf_dataset=True,  # True = HuggingFace Arrow format, False = legacy JSON format
     # Other settings
     save_steps=500,
     logging_steps=10,
@@ -492,7 +551,7 @@ def train_llada(
     Supports both LoRA and full fine-tuning modes with configurable components.
 
     Args:
-        dataset_path: Path to prepared dataset
+        dataset_path: Path to prepared dataset (directory for Arrow format, JSON file for legacy)
         model_path: Path to pre-trained LLaDA-V model
         output_dir: Directory to save checkpoints
         use_lora: Enable LoRA fine-tuning (faster, smaller checkpoints)
@@ -508,6 +567,7 @@ def train_llada(
         lora_alpha: LoRA alpha (only used if use_lora=True)
         lora_dropout: LoRA dropout (only used if use_lora=True)
         deepspeed_config: DeepSpeed config name (None=disabled, "zero2" or "zero3"=enabled)
+        use_hf_dataset: Use HuggingFace Arrow format (True, recommended) or legacy JSON (False)
 
     Returns:
         Dict with status and output directory
@@ -607,11 +667,6 @@ def train_llada(
         print("📍 No existing checkpoints - starting fresh training")
 
     # Build training command based on llada_v_finetune.sh
-    # Extract image folder from dataset path (parent directory of JSON file)
-    import os as os_module
-
-    dataset_dir = os_module.path.dirname(dataset_path)
-
     command = [
         "python",
         "/root/llava/train/train_mem.py",
@@ -620,90 +675,121 @@ def train_llada(
         model_path,
         "--version",
         "llava_llada",
-        "--data_path",
-        dataset_path,
-        "--image_folder",
-        dataset_dir,
         "--vision_tower",
         model_path,  # Vision tower is integrated in LLaDA-V
-        # Vision-language configuration (from reference script)
-        "--mm_tunable_parts",
-        mm_tunable_parts,
-        "--mm_projector_type",
-        "mlp2x_gelu",
-        "--mm_vision_select_layer",
-        "-2",
-        "--mm_use_im_start_end",
-        "False",
-        "--mm_use_im_patch_token",
-        "False",
-        "--mm_patch_merge_type",
-        "spatial_unpad",
-        # Image processing (using simpler settings for LaTeX OCR)
-        "--image_aspect_ratio",
-        "pad",  # Simpler than anyres_max_4 for LaTeX equations
-        "--group_by_modality_length",
-        "True",
-        # Training hyperparameters
-        "--output_dir",
-        output_dir,
-        "--num_train_epochs",
-        str(num_train_epochs),
-        "--per_device_train_batch_size",
-        str(per_device_train_batch_size),
-        "--gradient_accumulation_steps",
-        str(gradient_accumulation_steps),
-        "--learning_rate",
-        str(learning_rate),
-        "--warmup_ratio",
-        str(warmup_ratio),
-        "--weight_decay",
-        str(weight_decay),
-        "--lr_scheduler_type",
-        "cosine",
-        # Precision and optimization
-        "--bf16",
-        "True",
-        "--tf32",
-        "True",
-        "--model_max_length",
-        "2048",  # Shorter than 8192 for LaTeX (equations are typically short)
-        "--gradient_checkpointing",
-        "True",
-        "--attn_implementation",
-        "sdpa",
-        # Memory optimization: Use 8-bit AdamW to reduce optimizer memory usage
-        "--optim",
-        "adamw_8bit",
-        # Data loading
-        "--dataloader_num_workers",
-        "4",
-        "--lazy_preprocess",
-        "True",
-        "--dataloader_drop_last",
-        "True",
-        # Checkpointing and logging
-        "--save_strategy",
-        "steps",
-        "--save_steps",
-        str(save_steps),
-        "--save_total_limit",
-        "3",
-        "--logging_steps",
-        str(logging_steps),
-        "--report_to",
-        "wandb",
-        # Logging configuration for better WandB metrics
-        "--logging_nan_inf_filter",
-        str(logging_nan_inf_filter),
-        "--logging_first_step",
-        "True",
-        # Additional settings from reference
-        "--evaluation_strategy",
-        "no",
-        "--use_conversation_mask",
-        "False",
     ]
+
+    # Add dataset-specific arguments based on format
+    if use_hf_dataset:
+        # HuggingFace Arrow format: expect directory path
+        hf_dataset_path = dataset_path
+        if dataset_path.endswith(".json"):
+            # If user provided JSON path, use parent directory
+            hf_dataset_path = os.path.dirname(dataset_path)
+
+        command.extend(
+            [
+                "--data_path",
+                hf_dataset_path,
+                "--use_hf_dataset",
+                "True",
+            ]
+        )
+        # Note: --image_folder not needed for HF datasets (images are embedded)
+    else:
+        # Legacy JSON format: need both JSON file and image folder
+        dataset_dir = os.path.dirname(dataset_path)
+        command.extend(
+            [
+                "--data_path",
+                dataset_path,
+                "--image_folder",
+                dataset_dir,
+            ]
+        )
+
+    # Continue with common configuration
+    command.extend(
+        [
+            # Vision-language configuration (from reference script)
+            "--mm_tunable_parts",
+            mm_tunable_parts,
+            "--mm_projector_type",
+            "mlp2x_gelu",
+            "--mm_vision_select_layer",
+            "-2",
+            "--mm_use_im_start_end",
+            "False",
+            "--mm_use_im_patch_token",
+            "False",
+            "--mm_patch_merge_type",
+            "spatial_unpad",
+            # Image processing (using simpler settings for LaTeX OCR)
+            "--image_aspect_ratio",
+            "pad",  # Simpler than anyres_max_4 for LaTeX equations
+            "--group_by_modality_length",
+            "True",
+            # Training hyperparameters
+            "--output_dir",
+            output_dir,
+            "--num_train_epochs",
+            str(num_train_epochs),
+            "--per_device_train_batch_size",
+            str(per_device_train_batch_size),
+            "--gradient_accumulation_steps",
+            str(gradient_accumulation_steps),
+            "--learning_rate",
+            str(learning_rate),
+            "--warmup_ratio",
+            str(warmup_ratio),
+            "--weight_decay",
+            str(weight_decay),
+            "--lr_scheduler_type",
+            "cosine",
+            # Precision and optimization
+            "--bf16",
+            "True",
+            "--tf32",
+            "True",
+            "--model_max_length",
+            "2048",  # Shorter than 8192 for LaTeX (equations are typically short)
+            "--gradient_checkpointing",
+            "True",
+            "--attn_implementation",
+            "sdpa",
+            # Memory optimization: Use 8-bit AdamW to reduce optimizer memory usage
+            "--optim",
+            "adamw_8bit",
+            # Data loading
+            "--dataloader_num_workers",
+            "4",
+            "--lazy_preprocess",
+            "True",
+            "--dataloader_drop_last",
+            "True",
+            # Checkpointing and logging
+            "--save_strategy",
+            "steps",
+            "--save_steps",
+            str(save_steps),
+            "--save_total_limit",
+            "3",
+            "--logging_steps",
+            str(logging_steps),
+            "--report_to",
+            "wandb",
+            # Logging configuration for better WandB metrics
+            "--logging_nan_inf_filter",
+            str(logging_nan_inf_filter),
+            "--logging_first_step",
+            "True",
+            # Additional settings from reference
+            "--evaluation_strategy",
+            "no",
+            "--use_conversation_mask",
+            "False",
+        ]
+    )
 
     # Add DeepSpeed flag if enabled
     if deepspeed_config:
@@ -778,8 +864,8 @@ def train_llada(
     secrets=[huggingface_secret],
 )
 def merge_lora_checkpoint(
-    checkpoint_path: str = "/data/checkpoints/llada-latex-ocr/checkpoint-500",
-    base_model_path: str = "/data/models/LLaDA-V",
+    checkpoint_path: str = f"{CHECKPOINTS_DIR}/llada-latex-ocr/checkpoint-500",
+    base_model_path: str = f"{MODELS_DIR}/LLaDA-V",
     output_path: str = None,
     huggingface_repo_id: str = None,
     private: bool = True,
@@ -1190,7 +1276,7 @@ print(latex)
     secrets=[huggingface_secret],
 )
 def process_full_checkpoint(
-    checkpoint_path: str = "/data/checkpoints/llada-latex-ocr-full/checkpoint-7500",
+    checkpoint_path: str = f"{CHECKPOINTS_DIR}/llada-latex-ocr-full/checkpoint-7500",
     output_path: str = None,
     huggingface_repo_id: str = None,
     private: bool = True,
@@ -1303,7 +1389,7 @@ def process_full_checkpoint(
             config = json.load(f)
 
         # Update vision tower to use HuggingFace model ID
-        if config.get("mm_vision_tower") == "/data/models/LLaDA-V":
+        if config.get("mm_vision_tower") == f"{MODELS_DIR}/LLaDA-V":
             config["mm_vision_tower"] = "google/siglip2-so400m-patch14-384"
             with open(config_path, "w") as f:
                 json.dump(config, f, indent=2)
@@ -1451,8 +1537,8 @@ tokenizer, model, image_processor, _ = load_pretrained_model(
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def evaluate_model(
-    model_path="/data/checkpoints/llada-latex-ocr",
-    dataset_path="/data/latex_ocr_dataset_validation/dataset.json",
+    model_path=f"{CHECKPOINTS_DIR}/llada-latex-ocr",
+    dataset_path=f"{DATASETS_DIR}/latex_ocr_dataset_validation/dataset.json",
     output_dir="/data/evaluation_results",
     max_samples: int = 5,
     max_new_tokens: int = 512,
@@ -1516,7 +1602,7 @@ def evaluate_model(
 
     # Auto-detect model type and load accordingly
     model_type = None
-    base_model_path = "/data/models/LLaDA-V"
+    base_model_path = f"{MODELS_DIR}/LLaDA-V"
 
     if os.path.exists(model_path):
         # Local path - check if it's a directory with checkpoints
@@ -1800,7 +1886,7 @@ def evaluate_model(
 def inference_finetuned(
     image_path: str = None,
     image_data: str = None,
-    model_path="/data/checkpoints/llada-latex-ocr",
+    model_path=f"{CHECKPOINTS_DIR}/llada-latex-ocr",
     max_new_tokens: int = 512,
 ):
     """
@@ -1843,7 +1929,7 @@ def inference_finetuned(
 
     # Auto-detect model type and load accordingly
     model_type = None
-    base_model_path = "/data/models/LLaDA-V"
+    base_model_path = f"{MODELS_DIR}/LLaDA-V"
 
     if os.path.exists(model_path):
         # Local path - check if it's a directory with checkpoints
@@ -1960,17 +2046,27 @@ LLaDA-V Fine-tuning Pipeline
 
 Complete workflow for fine-tuning LLaDA-V on LaTeX OCR dataset.
 
+Configuration:
+--------------
+Edit OUTPUT_BASE_DIR at the top of this file to organize your experiments.
+Default paths:
+- Models: /data/models
+- Datasets: /data/datasets
+- Checkpoints: /data/checkpoints
+
+To separate experiments, change OUTPUT_BASE_DIR (e.g., "/data/experiment1")
+
 Step 1: Download and prepare dataset
 -------------------------------------
-# Full training dataset
-modal run modal_finetune_llada.py::download_and_prepare_dataset
+# HuggingFace Arrow format (RECOMMENDED - 2-5x faster loading, no corrupted images)
+modal run modal_finetune_llada.py::download_and_prepare_dataset --save-format arrow
+modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation --save-format arrow
+modal run modal_finetune_llada.py::download_and_prepare_dataset --max-samples 100 --save-format arrow
 
-# Validation dataset
-modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation
-
-# Limited samples for testing
-modal run modal_finetune_llada.py::download_and_prepare_dataset --max-samples 10000
-modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation --max-samples 1000
+# Legacy JSON format (backward compatibility)
+modal run modal_finetune_llada.py::download_and_prepare_dataset --save-format json
+modal run modal_finetune_llada.py::download_and_prepare_dataset --split validation --save-format json
+modal run modal_finetune_llada.py::download_and_prepare_dataset --max-samples 10000 --save-format json
 
 Step 2: Download pre-trained model
 -----------------------------------
@@ -1978,14 +2074,28 @@ modal run modal_finetune_llada.py::download_model
 
 Step 3: Train model
 -------------------
-# LoRA fine-tuning (recommended)
-modal run modal_finetune_llada.py::train_llada --use-lora True
+# LoRA fine-tuning with Arrow format (RECOMMENDED)
+modal run modal_finetune_llada.py::train_llada \
+    --use-lora True \
+    --use-hf-dataset True
 
-# Full fine-tuning
-modal run modal_finetune_llada.py::train_llada --use-lora False
+# LoRA fine-tuning with JSON format (legacy)
+modal run modal_finetune_llada.py::train_llada \
+    --use-lora True \
+    --use-hf-dataset False \
+    --dataset-path /data/datasets/latex_ocr_dataset_train/dataset.json
 
-# With DeepSpeed (multi-GPU)
-modal run modal_finetune_llada.py::train_llada --use-lora True --deepspeed-config "zero3"
+# Full fine-tuning with Arrow format
+modal run modal_finetune_llada.py::train_llada \
+    --use-lora False \
+    --use-hf-dataset True
+
+# With DeepSpeed (multi-GPU, JSON format)
+modal run modal_finetune_llada.py::train_llada \
+    --use-lora True \
+    --use-hf-dataset False \
+    --dataset-path /data/datasets/latex_ocr_dataset_train/dataset.json \
+    --deepspeed-config "zero3"
 
 Step 4a: Process LoRA checkpoint (if using LoRA)
 -------------------------------------------------
