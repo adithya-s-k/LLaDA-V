@@ -193,6 +193,11 @@ def download_and_prepare_dataset(
 
     target_dataset_path = f"{DATASETS_DIR}/latex_ocr_dataset_{split}"
 
+    # Default max_samples to 100 for validation split
+    if max_samples is None and split == "validation":
+        max_samples = 100
+        print(f"Defaulting to first 100 samples for validation split")
+
     print(f"Loading {dataset_name} ({split})")
     dataset = load_dataset(dataset_name, split=split)
 
@@ -1538,9 +1543,9 @@ tokenizer, model, image_processor, _ = load_pretrained_model(
 )
 def evaluate_model(
     model_path=f"{CHECKPOINTS_DIR}/llada-latex-ocr",
-    dataset_path=f"{DATASETS_DIR}/latex_ocr_dataset_validation/dataset.json",
+    dataset_path=f"{DATASETS_DIR}/latex_ocr_dataset_validation",
     output_dir="/data/evaluation_results",
-    max_samples: int = 5,
+    max_samples: int = 100,
     max_new_tokens: int = 512,
     batch_size: int = 1,  # Number of samples to process at once
 ):
@@ -1560,9 +1565,9 @@ def evaluate_model(
     Args:
         model_path: Path to merged model or HuggingFace repo ID
                    (For LoRA checkpoints, merge first using merge_lora_checkpoint)
-        dataset_path: Path to validation dataset
+        dataset_path: Path to validation dataset (Arrow format directory)
         output_dir: Directory to save evaluation results
-        max_samples: Maximum samples to evaluate (None for all)
+        max_samples: Maximum samples to evaluate (default=100, None for all)
         max_new_tokens: Maximum tokens to generate
         batch_size: Number of samples to process at once (default=1 for stability)
 
@@ -1662,17 +1667,15 @@ def evaluate_model(
     print(f"  Device: {device}")
     print(f"  Max length: {max_length}")
 
-    # Load dataset from JSON
+    # Load dataset from Arrow format
     print("\n[2/3] Loading dataset...")
     import json
-    from pathlib import Path as PathLib
+    from datasets import load_from_disk
 
-    dataset_dir = str(PathLib(dataset_path).parent)
-    with open(dataset_path, "r") as f:
-        dataset = json.load(f)
+    dataset = load_from_disk(dataset_path)
 
     if max_samples:
-        dataset = dataset[:max_samples]
+        dataset = dataset.select(range(min(max_samples, len(dataset))))
 
     print(f"✓ Evaluating {len(dataset)} samples with batch_size={batch_size}")
 
@@ -1681,8 +1684,6 @@ def evaluate_model(
     results = []
     exact_matches = 0
     bleu_scores, edit_distances, cer_scores, wer_scores = [], [], [], []
-
-    from PIL import Image as PILImage
 
     # Process in batches
     for batch_start in tqdm(
@@ -1700,12 +1701,13 @@ def evaluate_model(
             # Get individual samples from the batch
             for idx in range(batch_start, batch_end):
                 sample = dataset[idx]
-                image_path_rel = sample["image"]
+                # Arrow format: image is already a PIL Image object (embedded)
+                image = sample["image"]
                 ground_truth = sample["conversations"][1]["value"]
 
-                # Load image from file path (relative to dataset directory)
-                image_path_abs = os.path.join(dataset_dir, image_path_rel)
-                image = PILImage.open(image_path_abs).convert("RGB")
+                # Ensure image is in RGB mode
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
 
                 batch_images.append(image)
                 batch_ground_truths.append(ground_truth)
@@ -1750,20 +1752,32 @@ def evaluate_model(
                     temperature=0.0,
                 )
 
-            # Debug: Check output shapes
-            if batch_start == 0:
-                print(f"  Debug: batch_input_ids.shape = {batch_input_ids.shape}")
-                print(f"  Debug: output_ids.shape = {output_ids.shape}")
-                print(f"  Debug: num samples in batch = {len(batch_ground_truths)}")
+            # Decode entire batch at once (CORRECT PATTERN from eval/lmms-eval/)
+            text_outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
 
-            # Decode each output in the batch
-            for output, ground_truth, sample_id in zip(
-                output_ids, batch_ground_truths, batch_ids
+            # Debug: Check batch processing
+            if batch_start == 0:
+                print(f"  Debug: Processing {len(text_outputs)} outputs in first batch")
+                if len(text_outputs) > 0:
+                    print(
+                        f"  Debug: Sample prediction length: {len(text_outputs[0])} chars"
+                    )
+
+            # Process each decoded output
+            for prediction, ground_truth, sample_id in zip(
+                text_outputs, batch_ground_truths, batch_ids
             ):
                 try:
-                    prediction = tokenizer.decode(
-                        output[batch_input_ids.shape[1] :], skip_special_tokens=True
-                    ).strip()
+                    # Clean up prediction
+                    prediction = prediction.strip()
+
+                    # Remove input prompt from prediction if it's included
+                    # (batch_decode returns the full sequence including input)
+                    prompt_text = (
+                        "<image>\nConvert this mathematical expression to LaTeX code."
+                    )
+                    if prediction.startswith(prompt_text):
+                        prediction = prediction[len(prompt_text) :].strip()
 
                     # Calculate metrics
                     is_exact = prediction == ground_truth
@@ -1797,7 +1811,20 @@ def evaluate_model(
                         }
                     )
                 except Exception as e:
-                    print(f"  Error processing sample {sample_id}: {e}")
+                    print(f"  Warning: Error processing sample {sample_id}: {e}")
+                    # Still add failed sample with placeholder for tracking
+                    results.append(
+                        {
+                            "id": sample_id,
+                            "ground_truth": ground_truth,
+                            "prediction": "[DECODE_FAILED]",
+                            "exact_match": False,
+                            "bleu": 0.0,
+                            "edit_distance": len(ground_truth),
+                            "cer": 1.0,
+                            "wer": 1.0,
+                        }
+                    )
                     continue
 
             # Print progress
@@ -2155,7 +2182,8 @@ modal run modal_finetune_llada.py::evaluate_model \
 
 # Evaluate base model (for comparison)
 modal run modal_finetune_llada.py::evaluate_model \
-    --model-path /data/models/LLaDA-V
+    --model-path /data/models/LLaDA-V \
+    --batch-size 4
 
 Step 6: Test inference
 ----------------------

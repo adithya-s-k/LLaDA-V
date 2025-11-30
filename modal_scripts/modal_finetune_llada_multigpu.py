@@ -14,16 +14,17 @@ Usage:
     # Configure GPU settings at top of file:
     GPU_COUNT = 4
     GPU_TYPE = "A100-80GB"
+    OUTPUT_BASE_DIR = "/data/llada_single_gpu"
 
     # Train with FSDP (recommended for LoRA)
-    modal run modal_finetune_llada_multigpu.py::train_llada_fsdp --use-lora True
+    modal run modal_finetune_llada_multigpu.py::train_llada_fsdp --use-lora
 
-    # Train with vanilla DDP (simple multi-GPU)
-    modal run modal_finetune_llada_multigpu.py::train_llada_ddp --use-lora True
+    # Train with vanilla DDP (simple multi-GPU) - uses defaults
+    modal run modal_finetune_llada_multigpu.py::train_llada_ddp
 
     # Train with DDP + DeepSpeed (advanced optimization)
     modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \
-        --use-lora False \
+        --use-lora \
         --deepspeed-stage 2
 """
 
@@ -38,8 +39,14 @@ from modal import App, Image, Volume, Secret
 # MULTI-GPU CONFIGURATION - EDIT THESE VALUES
 # ==============================================================================
 
-GPU_COUNT = 4  # Options: 2, 4, 8
+GPU_COUNT = 4  # Options: 2, 4, 8 (currently configured for 4-GPU DDP training)
 GPU_TYPE = "A100-80GB"  # Options: "A100-80GB", "H100", "L40s"
+
+# Dataset Configuration - Update to match your volume structure
+OUTPUT_BASE_DIR = "/data/llada_single_gpu"  # Base directory in volume
+DATASETS_DIR = f"{OUTPUT_BASE_DIR}/datasets"
+MODELS_DIR = f"{OUTPUT_BASE_DIR}/models"
+CHECKPOINTS_DIR = f"{OUTPUT_BASE_DIR}/checkpoints"
 
 # Derived configuration for Modal
 MODAL_GPU_CONFIG = f"{GPU_TYPE}:{GPU_COUNT}"
@@ -330,19 +337,21 @@ def create_deepspeed_config(stage: int = 2) -> str:
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada_fsdp(
-    dataset_path: str = "/data/latex_ocr_dataset_train",
-    model_path: str = "/data/models/LLaDA-V",
-    output_dir: str = "/data/checkpoints/llada-latex-ocr-fsdp",
+    dataset_path: str = f"{DATASETS_DIR}/latex_ocr_dataset_train",
+    model_path: str = f"{MODELS_DIR}/LLaDA-V",
+    output_dir: str = f"{CHECKPOINTS_DIR}/llada-latex-ocr-fsdp",
     use_lora: bool = True,
     use_hf_dataset: bool = True,
     mm_tunable_parts: str = "mm_mlp_adapter,mm_language_model",
     num_train_epochs: int = 3,
     learning_rate: float = 2e-5,
+    warmup_ratio: float = 0.03,
+    weight_decay: float = 0.0,
     lora_r: int = 64,
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
-    save_steps: int = 500,
-    logging_steps: int = 10,
+    save_steps: int = 250,
+    logging_steps: int = 1,
 ):
     """
     Train LLaDA-V using FSDP (Fully Sharded Data Parallel).
@@ -446,89 +455,102 @@ def train_llada_fsdp(
     # Add dataset-specific arguments based on format
     if use_hf_dataset:
         # HuggingFace Arrow format
-        hf_dataset_path = dataset_path if not dataset_path.endswith(".json") else os.path.dirname(dataset_path)
+        hf_dataset_path = (
+            dataset_path
+            if not dataset_path.endswith(".json")
+            else os.path.dirname(dataset_path)
+        )
         command.extend(["--data_path", hf_dataset_path, "--use_hf_dataset", "True"])
     else:
         # Legacy JSON format
-        command.extend(["--data_path", dataset_path, "--image_folder", os.path.dirname(dataset_path)])
+        command.extend(
+            [
+                "--data_path",
+                dataset_path,
+                "--image_folder",
+                os.path.dirname(dataset_path),
+            ]
+        )
 
-    command.extend([
-        "--vision_tower",
-        model_path,
-        # Vision-language configuration
-        "--mm_tunable_parts",
-        mm_tunable_parts,
-        "--mm_projector_type",
-        "mlp2x_gelu",
-        "--mm_vision_select_layer",
-        "-2",
-        "--mm_use_im_start_end",
-        "False",
-        "--mm_use_im_patch_token",
-        "False",
-        "--mm_patch_merge_type",
-        "spatial_unpad",
-        "--image_aspect_ratio",
-        "pad",
-        "--group_by_modality_length",
-        "True",
-        # Training hyperparameters
-        "--output_dir",
-        output_dir,
-        "--num_train_epochs",
-        str(num_train_epochs),
-        "--per_device_train_batch_size",
-        str(per_device_train_batch_size),
-        "--gradient_accumulation_steps",
-        str(gradient_accumulation_steps),
-        "--learning_rate",
-        str(learning_rate),
-        "--warmup_ratio",
-        "0.03",
-        "--weight_decay",
-        "0.0",
-        "--lr_scheduler_type",
-        "cosine",
-        # Precision and optimization
-        "--bf16",
-        "True",
-        "--tf32",
-        "True",
-        "--model_max_length",
-        "2048",
-        "--gradient_checkpointing",
-        "True",
-        "--attn_implementation",
-        "sdpa",
-        "--optim",
-        "adamw_8bit",
-        # Data loading
-        "--dataloader_num_workers",
-        "4",
-        "--lazy_preprocess",
-        "True",
-        "--dataloader_drop_last",
-        "True",
-        # Checkpointing and logging
-        "--save_strategy",
-        "steps",
-        "--save_steps",
-        str(save_steps),
-        "--save_total_limit",
-        "3",
-        "--logging_steps",
-        str(logging_steps),
-        "--report_to",
-        "wandb",
-        "--logging_nan_inf_filter",
-        "False",
-        "--logging_first_step",
-        "True",
-        "--evaluation_strategy",
-        "no",
-        "--use_conversation_mask",
-        "False",
-    ])
+    command.extend(
+        [
+            "--vision_tower",
+            model_path,
+            # Vision-language configuration
+            "--mm_tunable_parts",
+            mm_tunable_parts,
+            "--mm_projector_type",
+            "mlp2x_gelu",
+            "--mm_vision_select_layer",
+            "-2",
+            "--mm_use_im_start_end",
+            "False",
+            "--mm_use_im_patch_token",
+            "False",
+            "--mm_patch_merge_type",
+            "spatial_unpad",
+            "--image_aspect_ratio",
+            "pad",
+            "--group_by_modality_length",
+            "True",
+            # Training hyperparameters
+            "--output_dir",
+            output_dir,
+            "--num_train_epochs",
+            str(num_train_epochs),
+            "--per_device_train_batch_size",
+            str(per_device_train_batch_size),
+            "--gradient_accumulation_steps",
+            str(gradient_accumulation_steps),
+            "--learning_rate",
+            str(learning_rate),
+            "--warmup_ratio",
+            str(warmup_ratio),
+            "--weight_decay",
+            str(weight_decay),
+            "--lr_scheduler_type",
+            "cosine",
+            # Precision and optimization
+            "--bf16",
+            "True",
+            "--tf32",
+            "True",
+            "--model_max_length",
+            "2048",
+            "--gradient_checkpointing",
+            "True",
+            "--attn_implementation",
+            "sdpa",
+            "--optim",
+            "adamw_8bit",
+            # Data loading
+            "--dataloader_num_workers",
+            "4",
+            "--lazy_preprocess",
+            "True",
+            "--dataloader_drop_last",
+            "True",
+            # Checkpointing and logging
+            "--save_strategy",
+            "steps",
+            "--save_steps",
+            str(save_steps),
+            "--save_total_limit",
+            "25",
+            "--logging_steps",
+            str(logging_steps),
+            "--report_to",
+            "wandb",
+            "--logging_nan_inf_filter",
+            "False",
+            "--logging_first_step",
+            "True",
+            "--evaluation_strategy",
+            "no",
+            "--use_conversation_mask",
+            "False",
+        ]
+    )
 
     # Add LoRA flags if enabled
     if use_lora:
@@ -590,19 +612,23 @@ def train_llada_fsdp(
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada_ddp(
-    dataset_path: str = "/data/latex_ocr_dataset_train",
-    model_path: str = "/data/models/LLaDA-V",
-    output_dir: str = "/data/checkpoints/llada-latex-ocr-ddp",
-    use_lora: bool = True,
+    dataset_path: str = f"{DATASETS_DIR}/latex_ocr_dataset_train",
+    model_path: str = f"{MODELS_DIR}/LLaDA-V",
+    output_dir: str = f"{CHECKPOINTS_DIR}/llada-latex-ocr-ddp",
+    use_lora: bool = False,  # Matching single-GPU config
     use_hf_dataset: bool = True,
     mm_tunable_parts: str = "mm_mlp_adapter,mm_language_model",
-    num_train_epochs: int = 2,
+    num_train_epochs: int = 2,  # Matching single-GPU config
+    per_device_train_batch_size: int = 8,  # Matching single-GPU config
+    gradient_accumulation_steps: int = 8,  # Matching single-GPU config
     learning_rate: float = 2e-5,
+    warmup_ratio: float = 0.03,  # Matching single-GPU config
+    weight_decay: float = 0.0,  # Matching single-GPU config
     lora_r: int = 64,
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
-    save_steps: int = 500,
-    logging_steps: int = 10,
+    save_steps: int = 250,
+    logging_steps: int = 1,
 ):
     """
     Train LLaDA-V using vanilla DDP (Distributed Data Parallel).
@@ -642,7 +668,7 @@ def train_llada_ddp(
 
     # Environment setup
     os.environ["WANDB_API_KEY"] = os.environ.get("WANDB_API_KEY", "")
-    os.environ["WANDB_PROJECT"] = "llada-latex-ocr-ddp"
+    os.environ["WANDB_PROJECT"] = "llada-latex-ocr"
     os.environ["HF_TOKEN"] = os.environ.get("HUGGINGFACE_TOKEN", "")
     os.environ["PYTHONPATH"] = "/root"
 
@@ -668,25 +694,14 @@ def train_llada_ddp(
     gpu_count = torch.cuda.device_count()
     print(f"Detected {gpu_count} GPUs")
 
-    # Auto-adjust batch size for DDP
-    # DDP replicates model, so memory usage is higher per GPU
-    if use_lora:
-        per_device_train_batch_size = 2
-    else:
-        per_device_train_batch_size = 1
-
-    # Adjust gradient accumulation to maintain effective batch size of 16
-    target_effective_batch = 16
-    gradient_accumulation_steps = max(
-        1, target_effective_batch // (per_device_train_batch_size * gpu_count)
-    )
-
+    # Use user-provided batch configuration (matching single-GPU settings)
     print()
     print("Batch Configuration:")
     print(f"  Per-device batch size: {per_device_train_batch_size}")
     print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"  Number of GPUs: {gpu_count}")
     print(
-        f"  Effective batch size: {per_device_train_batch_size * gpu_count * gradient_accumulation_steps}"
+        f"  Total effective batch size: {per_device_train_batch_size * gpu_count * gradient_accumulation_steps}"
     )
     print()
 
@@ -714,89 +729,102 @@ def train_llada_ddp(
     # Add dataset-specific arguments based on format
     if use_hf_dataset:
         # HuggingFace Arrow format
-        hf_dataset_path = dataset_path if not dataset_path.endswith(".json") else os.path.dirname(dataset_path)
+        hf_dataset_path = (
+            dataset_path
+            if not dataset_path.endswith(".json")
+            else os.path.dirname(dataset_path)
+        )
         command.extend(["--data_path", hf_dataset_path, "--use_hf_dataset", "True"])
     else:
         # Legacy JSON format
-        command.extend(["--data_path", dataset_path, "--image_folder", os.path.dirname(dataset_path)])
+        command.extend(
+            [
+                "--data_path",
+                dataset_path,
+                "--image_folder",
+                os.path.dirname(dataset_path),
+            ]
+        )
 
-    command.extend([
-        "--vision_tower",
-        model_path,
-        # Vision-language configuration
-        "--mm_tunable_parts",
-        mm_tunable_parts,
-        "--mm_projector_type",
-        "mlp2x_gelu",
-        "--mm_vision_select_layer",
-        "-2",
-        "--mm_use_im_start_end",
-        "False",
-        "--mm_use_im_patch_token",
-        "False",
-        "--mm_patch_merge_type",
-        "spatial_unpad",
-        "--image_aspect_ratio",
-        "pad",
-        "--group_by_modality_length",
-        "True",
-        # Training hyperparameters
-        "--output_dir",
-        output_dir,
-        "--num_train_epochs",
-        str(num_train_epochs),
-        "--per_device_train_batch_size",
-        str(per_device_train_batch_size),
-        "--gradient_accumulation_steps",
-        str(gradient_accumulation_steps),
-        "--learning_rate",
-        str(learning_rate),
-        "--warmup_ratio",
-        "0.03",
-        "--weight_decay",
-        "0.0",
-        "--lr_scheduler_type",
-        "cosine",
-        # Precision and optimization
-        "--bf16",
-        "True",
-        "--tf32",
-        "True",
-        "--model_max_length",
-        "2048",
-        "--gradient_checkpointing",
-        "True",
-        "--attn_implementation",
-        "sdpa",
-        "--optim",
-        "adamw_8bit",
-        # Data loading
-        "--dataloader_num_workers",
-        "4",
-        "--lazy_preprocess",
-        "True",
-        "--dataloader_drop_last",
-        "True",
-        # Checkpointing and logging
-        "--save_strategy",
-        "steps",
-        "--save_steps",
-        str(save_steps),
-        "--save_total_limit",
-        "3",
-        "--logging_steps",
-        str(logging_steps),
-        "--report_to",
-        "wandb",
-        "--logging_nan_inf_filter",
-        "False",
-        "--logging_first_step",
-        "True",
-        "--evaluation_strategy",
-        "no",
-        "--use_conversation_mask",
-        "False",
-    ])
+    command.extend(
+        [
+            "--vision_tower",
+            model_path,
+            # Vision-language configuration
+            "--mm_tunable_parts",
+            mm_tunable_parts,
+            "--mm_projector_type",
+            "mlp2x_gelu",
+            "--mm_vision_select_layer",
+            "-2",
+            "--mm_use_im_start_end",
+            "False",
+            "--mm_use_im_patch_token",
+            "False",
+            "--mm_patch_merge_type",
+            "spatial_unpad",
+            "--image_aspect_ratio",
+            "pad",
+            "--group_by_modality_length",
+            "True",
+            # Training hyperparameters
+            "--output_dir",
+            output_dir,
+            "--num_train_epochs",
+            str(num_train_epochs),
+            "--per_device_train_batch_size",
+            str(per_device_train_batch_size),
+            "--gradient_accumulation_steps",
+            str(gradient_accumulation_steps),
+            "--learning_rate",
+            str(learning_rate),
+            "--warmup_ratio",
+            str(warmup_ratio),
+            "--weight_decay",
+            str(weight_decay),
+            "--lr_scheduler_type",
+            "cosine",
+            # Precision and optimization
+            "--bf16",
+            "True",
+            "--tf32",
+            "True",
+            "--model_max_length",
+            "2048",
+            "--gradient_checkpointing",
+            "True",
+            "--attn_implementation",
+            "sdpa",
+            "--optim",
+            "adamw_8bit",
+            # Data loading
+            "--dataloader_num_workers",
+            "4",
+            "--lazy_preprocess",
+            "True",
+            "--dataloader_drop_last",
+            "True",
+            # Checkpointing and logging
+            "--save_strategy",
+            "steps",
+            "--save_steps",
+            str(save_steps),
+            "--save_total_limit",
+            "25",
+            "--logging_steps",
+            str(logging_steps),
+            "--report_to",
+            "wandb",
+            "--logging_nan_inf_filter",
+            "False",
+            "--logging_first_step",
+            "True",
+            "--evaluation_strategy",
+            "no",
+            "--use_conversation_mask",
+            "False",
+        ]
+    )
 
     # Add LoRA flags if enabled
     if use_lora:
@@ -852,19 +880,21 @@ def train_llada_ddp(
     secrets=[huggingface_secret, Secret.from_dotenv()],
 )
 def train_llada_ddp_deepspeed(
-    dataset_path: str = "/data/latex_ocr_dataset_train",
-    model_path: str = "/data/models/LLaDA-V",
-    output_dir: str = "/data/checkpoints/llada-latex-ocr-ddp",
+    dataset_path: str = f"{DATASETS_DIR}/latex_ocr_dataset_train",
+    model_path: str = f"{MODELS_DIR}/LLaDA-V",
+    output_dir: str = f"{CHECKPOINTS_DIR}/llada-latex-ocr-ddp-deepspeed",
     use_lora: bool = True,
     use_hf_dataset: bool = True,
     mm_tunable_parts: str = "mm_mlp_adapter,mm_language_model",
     num_train_epochs: int = 3,
     learning_rate: float = 2e-5,
+    warmup_ratio: float = 0.03,
+    weight_decay: float = 0.0,
     lora_r: int = 64,
     lora_alpha: int = 128,
     lora_dropout: float = 0.05,
-    save_steps: int = 500,
-    logging_steps: int = 10,
+    save_steps: int = 250,
+    logging_steps: int = 1,
     deepspeed_stage: int = 2,
 ):
     """
@@ -985,87 +1015,100 @@ def train_llada_ddp_deepspeed(
     # Add dataset-specific arguments based on format
     if use_hf_dataset:
         # HuggingFace Arrow format
-        hf_dataset_path = dataset_path if not dataset_path.endswith(".json") else os.path.dirname(dataset_path)
+        hf_dataset_path = (
+            dataset_path
+            if not dataset_path.endswith(".json")
+            else os.path.dirname(dataset_path)
+        )
         command.extend(["--data_path", hf_dataset_path, "--use_hf_dataset", "True"])
     else:
         # Legacy JSON format
-        command.extend(["--data_path", dataset_path, "--image_folder", os.path.dirname(dataset_path)])
+        command.extend(
+            [
+                "--data_path",
+                dataset_path,
+                "--image_folder",
+                os.path.dirname(dataset_path),
+            ]
+        )
 
-    command.extend([
-        "--vision_tower",
-        model_path,
-        # Vision-language configuration
-        "--mm_tunable_parts",
-        mm_tunable_parts,
-        "--mm_projector_type",
-        "mlp2x_gelu",
-        "--mm_vision_select_layer",
-        "-2",
-        "--mm_use_im_start_end",
-        "False",
-        "--mm_use_im_patch_token",
-        "False",
-        "--mm_patch_merge_type",
-        "spatial_unpad",
-        "--image_aspect_ratio",
-        "pad",
-        "--group_by_modality_length",
-        "True",
-        # Training hyperparameters
-        "--output_dir",
-        output_dir,
-        "--num_train_epochs",
-        str(num_train_epochs),
-        "--per_device_train_batch_size",
-        str(per_device_train_batch_size),
-        "--gradient_accumulation_steps",
-        str(gradient_accumulation_steps),
-        "--learning_rate",
-        str(learning_rate),
-        "--warmup_ratio",
-        "0.03",
-        "--weight_decay",
-        "0.0",
-        "--lr_scheduler_type",
-        "cosine",
-        # Precision and optimization
-        "--bf16",
-        "True",
-        "--tf32",
-        "True",
-        "--model_max_length",
-        "2048",
-        "--gradient_checkpointing",
-        "True",
-        "--attn_implementation",
-        "sdpa",
-        # Data loading
-        "--dataloader_num_workers",
-        "4",
-        "--lazy_preprocess",
-        "True",
-        "--dataloader_drop_last",
-        "True",
-        # Checkpointing and logging
-        "--save_strategy",
-        "steps",
-        "--save_steps",
-        str(save_steps),
-        "--save_total_limit",
-        "3",
-        "--logging_steps",
-        str(logging_steps),
-        "--report_to",
-        "wandb",
-        "--logging_nan_inf_filter",
-        "False",
-        "--logging_first_step",
-        "True",
-        "--evaluation_strategy",
-        "no",
-        "--use_conversation_mask",
-        "False",
-    ])
+    command.extend(
+        [
+            "--vision_tower",
+            model_path,
+            # Vision-language configuration
+            "--mm_tunable_parts",
+            mm_tunable_parts,
+            "--mm_projector_type",
+            "mlp2x_gelu",
+            "--mm_vision_select_layer",
+            "-2",
+            "--mm_use_im_start_end",
+            "False",
+            "--mm_use_im_patch_token",
+            "False",
+            "--mm_patch_merge_type",
+            "spatial_unpad",
+            "--image_aspect_ratio",
+            "pad",
+            "--group_by_modality_length",
+            "True",
+            # Training hyperparameters
+            "--output_dir",
+            output_dir,
+            "--num_train_epochs",
+            str(num_train_epochs),
+            "--per_device_train_batch_size",
+            str(per_device_train_batch_size),
+            "--gradient_accumulation_steps",
+            str(gradient_accumulation_steps),
+            "--learning_rate",
+            str(learning_rate),
+            "--warmup_ratio",
+            str(warmup_ratio),
+            "--weight_decay",
+            str(weight_decay),
+            "--lr_scheduler_type",
+            "cosine",
+            # Precision and optimization
+            "--bf16",
+            "True",
+            "--tf32",
+            "True",
+            "--model_max_length",
+            "2048",
+            "--gradient_checkpointing",
+            "True",
+            "--attn_implementation",
+            "sdpa",
+            # Data loading
+            "--dataloader_num_workers",
+            "4",
+            "--lazy_preprocess",
+            "True",
+            "--dataloader_drop_last",
+            "True",
+            # Checkpointing and logging
+            "--save_strategy",
+            "steps",
+            "--save_steps",
+            str(save_steps),
+            "--save_total_limit",
+            "25",
+            "--logging_steps",
+            str(logging_steps),
+            "--report_to",
+            "wandb",
+            "--logging_nan_inf_filter",
+            "False",
+            "--logging_first_step",
+            "True",
+            "--evaluation_strategy",
+            "no",
+            "--use_conversation_mask",
+            "False",
+        ]
+    )
 
     # Add LoRA flags if enabled
     if use_lora:
@@ -1120,75 +1163,118 @@ def train_llada_ddp_deepspeed(
 # ==============================================================================
 
 """
-SINGLE GPU TRAINING (modal_finetune_llada.py):
-------------------------------------------------
+===============================================================================
+LLADA-V MULTI-GPU TRAINING - 4 GPUs DDP Configuration
+===============================================================================
 
-# Prepare dataset (HuggingFace Arrow format - RECOMMENDED):
+VOLUME: llada-v-finetune-vol
+DATASET PATH: /data/llada_single_gpu/datasets/latex_ocr_dataset_train (Arrow format)
+GPU CONFIG: 4x A100-80GB with vanilla DDP
+
+CONFIGURATION AT TOP OF FILE:
+------------------------------
+GPU_COUNT = 4
+GPU_TYPE = "A100-80GB"
+OUTPUT_BASE_DIR = "/data/llada_single_gpu"
+
+STEP 1: Prepare Dataset (Arrow Format)
+---------------------------------------
+# Run from single-GPU script to prepare dataset in Arrow format
 modal run modal_finetune_llada.py::download_and_prepare_dataset \\
-    --save-format arrow \\
-    --max-samples 100
+    --save-format arrow
 
-# Train with Arrow format:
-modal run modal_finetune_llada.py::train_llada \\
-    --dataset-path /data/datasets/latex_ocr_dataset_train \\
-    --use-hf-dataset True \\
-    --use-lora True
+# This creates: /data/llada_single_gpu/datasets/latex_ocr_dataset_train/
 
-# Prepare dataset (Legacy JSON format):
-modal run modal_finetune_llada.py::download_and_prepare_dataset \\
-    --save-format json \\
-    --max-samples 100
+STEP 2: Download Model
+----------------------
+modal run modal_finetune_llada.py::download_model
 
-# Train with JSON format:
-modal run modal_finetune_llada.py::train_llada \\
-    --dataset-path /data/datasets/latex_ocr_dataset_train/dataset.json \\
-    --use-hf-dataset False \\
-    --use-lora True
+# This creates: /data/llada_single_gpu/models/LLaDA-V/
+
+STEP 3: Run 4-GPU DDP Training
+-------------------------------
+# RECOMMENDED: Vanilla DDP with Arrow dataset (matching single-GPU config)
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp
+
+# This will use the following defaults:
+# - Dataset: /data/llada_single_gpu/datasets/latex_ocr_dataset_train (Arrow format)
+# - GPUs: 4x A100-80GB
+# - Per-device batch size: 8
+# - Gradient accumulation: 8
+# - Total effective batch size: 256 (8 * 4 * 8)
+# - Epochs: 2
+# - Learning rate: 2e-5
+# - LoRA: Disabled (full fine-tuning)
+
+# Output: /data/llada_single_gpu/checkpoints/llada-latex-ocr-ddp/
 
 
-MULTI-GPU TRAINING (modal_finetune_llada_multigpu.py):
--------------------------------------------------------
+ALTERNATIVE TRAINING STRATEGIES:
+---------------------------------
+
+# FSDP Training (for larger models or memory constraints):
+modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \
+    --use-lora
+
+# DDP + DeepSpeed ZeRO-2 (advanced optimization):
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \
+    --deepspeed-stage 2
+
+
+MONITORING:
+-----------
+# View logs in Modal dashboard
+# WandB project: llada-latex-ocr
+# Checkpoints saved every 500 steps
+
+
+===============================================================================
+
+
+MULTI-GPU TRAINING - OTHER CONFIGURATIONS:
+-------------------------------------------
 
 # Configure GPUs at top of file:
 GPU_COUNT = 4  # Options: 2, 4, 8
 GPU_TYPE = "A100-80GB"  # Options: "A100-80GB", "H100", "L40s"
+OUTPUT_BASE_DIR = "/data/llada_single_gpu"  # Match your volume structure
 
 # FSDP Training (Arrow format - RECOMMENDED):
-modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \\
-    --dataset-path /data/latex_ocr_dataset_train \\
-    --use-hf-dataset True \\
-    --use-lora True
+modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \
+    --dataset-path /data/latex_ocr_dataset_train \
+    --use-hf-dataset \
+    --use-lora
 
 # FSDP Training (JSON format):
-modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \\
-    --dataset-path /data/latex_ocr_dataset_train/dataset.json \\
-    --use-hf-dataset False \\
-    --use-lora True
+modal run modal_finetune_llada_multigpu.py::train_llada_fsdp \
+    --dataset-path /data/latex_ocr_dataset_train/dataset.json \
+    --no-use-hf-dataset \
+    --use-lora
 
 # Vanilla DDP Training (Arrow format - RECOMMENDED):
-modal run modal_finetune_llada_multigpu.py::train_llada_ddp \\
-    --dataset-path /data/latex_ocr_dataset_train \\
-    --use-hf-dataset True \\
-    --use-lora True
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp \
+    --dataset-path /data/llada_single_gpu/datasets/latex_ocr_dataset_train \
+    --use-hf-dataset \
+    --use-lora
 
 # Vanilla DDP Training (JSON format):
-modal run modal_finetune_llada_multigpu.py::train_llada_ddp \\
-    --dataset-path /data/latex_ocr_dataset_train/dataset.json \\
-    --use-hf-dataset False \\
-    --use-lora True
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp \
+    --dataset-path /data/latex_ocr_dataset_train/dataset.json \
+    --no-use-hf-dataset \
+    --use-lora
 
 # DDP + DeepSpeed Training (Arrow format - RECOMMENDED):
-modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \\
-    --dataset-path /data/latex_ocr_dataset_train \\
-    --use-hf-dataset True \\
-    --use-lora True \\
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \
+    --dataset-path /data/latex_ocr_dataset_train \
+    --use-hf-dataset \
+    --use-lora \
     --deepspeed-stage 2
 
 # DDP + DeepSpeed Training (JSON format):
-modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \\
-    --dataset-path /data/latex_ocr_dataset_train/dataset.json \\
-    --use-hf-dataset False \\
-    --use-lora True \\
+modal run modal_finetune_llada_multigpu.py::train_llada_ddp_deepspeed \
+    --dataset-path /data/latex_ocr_dataset_train/dataset.json \
+    --no-use-hf-dataset \
+    --use-lora \
     --deepspeed-stage 2
 
 
